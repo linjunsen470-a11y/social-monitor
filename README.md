@@ -49,8 +49,7 @@ pytest
 - 付费 Actor 默认不运行；必须显式 `--execute`。
 - 不创建定时任务、不部署。
 
-详细移交说明：`docs/IDE_AGENT_HANDOFF.md`
-首轮实测：`FIRST_RUN_RESULTS.md`
+首轮试采和开发背景见[实测记录](FIRST_RUN_RESULTS.md)、[原始交接说明](docs/IDE_AGENT_HANDOFF.md)和[早期构建记录](docs/BUILD_STATUS.md)。
 
 ## 自营视频覆盖和整条重发报告
 

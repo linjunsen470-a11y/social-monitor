@@ -386,8 +386,8 @@ def track_account(
             if not reference:
                 raise typer.BadParameter("视频号链接未提供稳定账号 ID，请用 --kind name 查找")
         else:
-            prefix = "/user/" if platform == "douyin" else "/user/profile/"
-            match = re.match(re.escape(prefix) + r"([^/]+)(?:/|$)", parts.path)
+            prefix = r"/(?:share/)?user/" if platform == "douyin" else "/user/profile/"
+            match = re.match(prefix + r"([^/]+)(?:/|$)", parts.path)
             if not match:
                 raise typer.BadParameter("主页链接缺少稳定账号 ID")
             reference = match[1]

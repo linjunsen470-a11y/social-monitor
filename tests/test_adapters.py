@@ -44,3 +44,30 @@ def test_track_profile_uses_account_path_segment(monkeypatch):
         )
         assert result.exit_code == 0, result.exception
     assert seen == ["stable"] * 3
+
+
+def test_track_douyin_mobile_share_redirect(monkeypatch):
+    import httpx
+    from typer.testing import CliRunner
+    from catering_watch import cli
+
+    short = "https://v.douyin.com/abc/"
+    profile = "https://www.iesdouyin.com/share/user/stable?from=share"
+
+    def handle(request):
+        if str(request.url) == short:
+            return httpx.Response(302, headers={"Location": profile})
+        assert str(request.url) == profile
+        return httpx.Response(200)
+
+    client_type = httpx.Client
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kw: client_type(transport=httpx.MockTransport(handle), **kw)
+    )
+    seen = []
+    monkeypatch.setattr(cli.tracking, "register", lambda *args: seen.append(args))
+    result = CliRunner().invoke(
+        cli.app, ["track-account", "品牌", "douyin", short, "--kind", "url", "--execute"]
+    )
+    assert result.exit_code == 0, result.exception
+    assert seen == [("品牌", "douyin", "stable", None)]
