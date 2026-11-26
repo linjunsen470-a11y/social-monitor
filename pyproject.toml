@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "catering-competitor-intelligence"
+version = "0.2.0"
+description = "Agent-first cross-platform public competitor content research for catering businesses"
+requires-python = ">=3.11"
+dependencies = [
+  "typer>=0.12,<1",
+  "rich>=13.7,<15",
+  "python-dotenv>=1.0,<2",
+  "psycopg[binary]>=3.2,<4",
+  "httpx>=0.27,<1",
+  "rapidfuzz>=3.9,<4",
+  "Pillow>=10,<13",
+  "ImageHash>=4.3,<5",
+]
+
+[project.optional-dependencies]
+llm = ["openai>=1.40,<3"]
+test = ["hatchling>=1.25", "pytest>=8,<9", "ruff>=0.6,<1"]
+
+[project.scripts]
+competitor-watch = "catering_watch.cli:app"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/catering_watch"]
