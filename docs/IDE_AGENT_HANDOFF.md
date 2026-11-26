@@ -35,14 +35,12 @@
 用户当前 `.env` 状态核查发现：
 - `APIFY_TOKEN` 尚未配置；
 - `DATABASE_URL` 仍为占位符；
-- `OPENAI_API_KEY` 为空。
 
 IDE Agent 接手后：
 1. 请用户在本地 IDE/Secret 管理中填入 Apify API Token。
 2. 填入 Neon 的 `catering_watch_app` 角色连接串，不能使用 Neon owner。
-3. `OPENAI_API_KEY` 可选；基础规则不依赖它。
-4. 不要把任何密钥写进 Git、日志、CSV、JSONL 或最终公开压缩包。
-5. 运行 `competitor-watch doctor --check-apify` 验证真实 Apify REST API Key。
+3. 不要把任何密钥写进 Git、日志、CSV、JSONL 或最终公开压缩包。
+4. 运行 `competitor-watch doctor --check-apify` 验证真实 Apify REST API Key。
 
 ## 4. 当前代码能力
 
@@ -77,12 +75,11 @@ IDE Agent 接手后：
 - LLM 只负责提出品牌简称、关键词变体、跨平台搜索策略和疑难样本解释。
 - Python 负责 API、限流、缓存、费用、数据库、去重和证据记录。
 - 模型不可绕过预算网关直接调用付费 Actor。
-- LLM Key 不配置时，确定性流程仍能运行。
 - 输出应区分“同一运营方账号已发现”与“同一视频分发”。
 
 ### P3：增量和并发安全
 - 增加数据库级原子预算预留（transaction/advisory lock），防止两个 Codex Cloud 沙箱同时超支。
-- 将查询缓存从“关键词+时间窗”升级为包含 Actor 版本、平台参数、分页游标的规范化请求指纹。
+- 查询缓存使用 Actor、构建标签和完整请求参数生成指纹，分页游标随请求参数计入。
 - 处理分页、游标续跑、时间窗重叠和晚发/补发。
 - 加入 `fetch_runs` 的 started/running 状态和失败冷却，不要重复发起并行的同一查询。
 - 不要因为一次失败把旧成功缓存标记为无效。
@@ -120,11 +117,11 @@ competitor-watch report --kind matches --format jsonl --output outputs/matches.j
 pytest
 ```
 
-注意：目前 CSV seed 示例的列名是旧格式，IDE Agent 应统一为 `platform,url,query,max_items`，并保留旧字段兼容或迁移示例文件。
+批量输入使用 `data/seed_accounts.csv` 中的列名 `platform,url,query,max_items`。
 
 ## 7. 验收条件
 
-- 新 Codex Cloud 沙箱能连接同一个 Neon 数据库，读取历史 5 个账号/作品样本，而不重新采集。
+- 新 Codex Cloud 沙箱能连接同一个 Neon 数据库，读取该项目已入库的账号和作品。
 - 同一账号/作品重复写入返回同一主键。
 - 数据库断连时立即停止，不建立本地空数据库。
 - Apify token 验证成功，Actor API 通过 Bearer token 直连成功。

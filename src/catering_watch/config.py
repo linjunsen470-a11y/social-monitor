@@ -8,8 +8,6 @@ load_dotenv()
 class Settings:
     database_url: str = os.getenv("DATABASE_URL", "")
     apify_token: str = os.getenv("APIFY_TOKEN", "")
-    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-6-mini")
     project_key: str = os.getenv("PROJECT_KEY", "guangzhou_catering_competitors")
     max_cost_usd: float = float(os.getenv("MAX_COST_USD", "1.00"))
     cache_ttl_hours: int = int(os.getenv("CACHE_TTL_HOURS", "24"))
