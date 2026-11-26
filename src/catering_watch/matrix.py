@@ -33,6 +33,20 @@ def search_terms(brand):
     return list(dict.fromkeys([brand["name"], *brand.get("entities", []), *brand["aliases"]]))
 
 
+def search_outcome(query, items, raw_count):
+    if not items:
+        return "sparse" if raw_count else "empty"
+    brand = next((b for b in CATALOG if query in search_terms(b)), None)
+    terms = search_terms(brand) if brand else [query]
+    for item in items:
+        description = " ".join(filter(None, (item.author_name, item.title, item.body))).casefold()
+        if any(term.casefold() in description for term in terms):
+            return "candidate"
+    if raw_count > len(items):
+        return "sparse"
+    return "no_relevant"
+
+
 def seed_brand(platform, pid):
     return next((b for b in CATALOG if pid in b.get("seeds", {}).get(platform, [])), None)
 
@@ -217,7 +231,7 @@ def read_report(kind, on_match=None):
         ).fetchall()
         runs = conn.execute(
             """SELECT platform,status,finished_at,metadata FROM catering_watch.fetch_runs
-            WHERE project_key=%s AND operation IN ('channelSearch','search_users','videoSearch','search_videos','search_notes') AND finished_at BETWEEN %s AND %s
+            WHERE project_key=%s AND operation IN ('channelSearch','search_users','videoSearch','search_videos','search_notes','public_post_search') AND finished_at BETWEEN %s AND %s
             ORDER BY finished_at""",
             (settings.project_key, window["start"], window["finish"]),
         ).fetchall()

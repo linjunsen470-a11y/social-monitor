@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from decimal import Decimal
+from urllib.parse import parse_qs, quote, urlsplit
 
 from .ingest import replay_fields, timestamp
 
@@ -38,6 +39,12 @@ class PlatformAdapter:
     actor = ""
     price_per_item = 0.005
     start_fee = 0.00005
+
+    def prepare_row(self, row):
+        return row
+
+    def actor_input(self, payload):
+        return payload
 
     def item_price(self, operation):
         return Decimal(str(self.price_per_item))
@@ -112,17 +119,28 @@ class ChannelsAdapter(PlatformAdapter):
             operation, Decimal(".00400")
         )
 
-    def search_payload(self, q, n):
+    def actor_input(self, payload):
+        # The result limit affects the charge cap and cache key, not the Actor API.
+        return {k: v for k, v in payload.items() if k != "_limit"}
+
+    def search_payload(self, q, n, *, sort="latest", published="halfYear"):
         return {
             "operation": "videoSearch",
             "keywords": [q],
+            "_limit": n,
             "maxPages": 1,
-            "sortBy": "latest",
-            "publishTime": "halfYear",
+            "sortBy": sort,
+            "publishTime": published,
             "duration": "all",
         }
 
     def reference_payload(self, reference):
+        parts = urlsplit(reference)
+        if (
+            parts.hostname == "channels.weixin.qq.com"
+            and parts.path.rstrip("/") == "/finder-preview/pages/feed"
+        ):
+            reference = parse_qs(parts.query).get("eid", [reference])[0]
         return {"operation": "videoDetail", "videos": [reference]}
 
     def profile_payload(self, reference, limit):
@@ -157,7 +175,14 @@ class ChannelsAdapter(PlatformAdapter):
         return SearchResult(
             self.platform,
             str(pid),
-            r.get("url"),
+            r.get("shareUrl")
+            or r.get("url")
+            or (
+                "https://channels.weixin.qq.com/finder-preview/pages/feed?eid="
+                + quote(str(r["exportId"]), safe="/")
+                if r.get("exportId")
+                else None
+            ),
             timestamp(published),
             title,
             title,
@@ -231,4 +256,9 @@ def is_profile_reference(platform: str, reference: str) -> bool:
         return "/user/" in v
     if platform == "xiaohongshu":
         return "/user/profile/" in v
-    return "channels.weixin.qq.com" in v and ("profile" in v or "finder" in v)
+    parts = urlsplit(reference)
+    return parts.hostname == "channels.weixin.qq.com" and (
+        "profile" in parts.path.lower().split("/")
+        or parts.path.rstrip("/").lower() == "/finder"
+        and bool(channels_account_ids(parse_qs(parts.query)))
+    )

@@ -430,7 +430,7 @@ def test_channels_account_aliases_and_full_page(project, monkeypatch):
     assert candidate["id"] == "channel"
     ids = tracking.sync("测试品牌", "channels", "channel", budget, 1, cli._persist)
     assert len(set(ids)) == 2
-    assert db.stored_post("channels", "docID:doc")["id"] == ids[0]
+    assert db.stored_post("channels", "hashDocID:shared", {"hashDocID": "shared"})["id"] == ids[0]
     with connect() as conn:
         (brand,) = tracking.catalog_for(conn, [])
     assert all(
@@ -627,3 +627,145 @@ def test_real_scan_cache_avoids_reprocessing_persisted_posts(project, monkeypatc
     cached = cli._cross_search(*args)
     assert len(cached) == 2 and all(r["cache_hit"] for r in cached)
     assert provider.starts == 2
+
+
+def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_path):
+    import json
+
+    from openpyxl import load_workbook
+    from typer.testing import CliRunner
+
+    from catering_watch import cli, db, research
+
+    for module in (research, cli):
+        monkeypatch.setattr(module, "settings", db.settings)
+    monkeypatch.setattr(tracking.Budget, "request", lambda *a, **kw: pytest.fail("paid call"))
+    monkeypatch.setattr(cli, "_ensure_cover", lambda *a, **kw: pytest.fail("network call"))
+    brand = "某团餐"
+    archive = [
+        (
+            "channels",
+            "videoSearch",
+            "广州食堂承包",
+            [{"docID": "doc", "exportId": "export/x", "title": "=menu"}],
+        ),
+        (
+            "channels",
+            "videoDetail",
+            "export/x",
+            [{"videoId": "vid", "username": "wx-id", "nickname": brand, "title": ""}],
+        ),
+        (
+            "douyin",
+            "public_post_search",
+            brand,
+            [{"aweme_id": "d", "desc": "试餐", "author": {"nickname": brand, "sec_uid": "dy-id"}}],
+        ),
+        (
+            "xiaohongshu",
+            "public_post_search",
+            brand,
+            [
+                {
+                    "id": "n",
+                    "user": {"userid": "xhs-id", "nickname": brand},
+                    "type": "normal",
+                    "desc": "餐标",
+                }
+            ],
+        ),
+    ]
+    records = [
+        dict(platform=p, operation=o, query=q, rows=rows, run_id=f"run-{i}")
+        for i, (p, o, q, rows) in enumerate(archive)
+    ]
+    manifest = tmp_path / "inputs.json"
+    output = tmp_path / "out.xlsx"
+    args = [
+        "research",
+        "--query",
+        "广州食堂承包",
+        "--replay",
+        str(manifest),
+        "--execute",
+        "--output",
+        str(output),
+    ]
+    runner = CliRunner()
+    for complete in (True, False):
+        manifest.write_text(json.dumps(records if complete else records[:-1]))
+        result = runner.invoke(cli.app, args)
+        assert result.exit_code == (0 if complete else 1), (result.output, result.exception)
+        rid = result.output.split("调研 ID ")[1].splitlines()[0]
+        book = load_workbook(output)
+        wx = list(book["微信视频作品"].values)[1]
+        assert wx[0:3] == (brand, "channels", brand) and "wx-id" in wx
+        assert "=menu" in wx and all(cell.data_type != "f" for cell in book["微信视频作品"][2])
+        assert len(list(book["跨平台作品证据"].values)) == (3 if complete else 2)
+        status = list(book["竞品三端核查"].values)[1][3]
+        assert status == ("有候选" if complete else "缺少回放记录")
+        copy = tmp_path / "export.xlsx"
+        assert (
+            runner.invoke(cli.app, ["research-report", rid, "--output", str(copy)]).exit_code == 0
+        )
+        assert [list(s.values) for s in book] == [list(s.values) for s in load_workbook(copy)]
+    with connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) n FROM catering_watch.posts WHERE project_key=%s", (project,)
+            ).fetchone()["n"]
+            == 3
+        )
+
+
+def test_research_online_budget_and_actor_protocol(project, monkeypatch, tmp_path):
+    from typer.testing import CliRunner
+    from catering_watch import cli, db, research
+
+    starts = []
+
+    class Transport:
+        def start(self, actor, payload, cap, build):
+            starts.append((actor, payload, cap))
+            assert cap > 0
+            return {
+                "id": actor,
+                "defaultDatasetId": actor,
+                "usageTotalUsd": 0.005,
+                "status": "SUCCEEDED",
+            }
+
+        def page(self, dataset, offset, limit):
+            if "wechat" in dataset:
+                return [{"exportId": "export/x", "creatorName": "本地餐饮", "username": "wx"}]
+            if "douyin" in dataset:
+                return [{"aweme_id": "d", "author": {"nickname": "dy", "sec_uid": "stable"}}]
+            return [{"id": "n", "user": {"userid": "x", "nickname": "red"}, "desc": "团餐菜单"}]
+
+    for module in (cli, research):
+        monkeypatch.setattr(module, "settings", db.settings)
+    monkeypatch.setattr(ingest, "ApifyClient", Transport)
+    args = [
+        "research",
+        "--query",
+        "广州团餐",
+        "--execute",
+        "--max-cost",
+        "0.2",
+        "--max-items",
+        "2",
+        "--output",
+        str(tmp_path / "a.xlsx"),
+    ]
+    for _ in range(2):
+        r = CliRunner().invoke(cli.app, args)
+        assert r.exit_code == 0, (r.output, r.exception)
+    assert len(starts) == 3 and starts[0][1]["operation"] == "videoSearch"
+    assert starts[1][1] == {"keyword": "本地餐饮", "maxItems": 3}
+    assert starts[2][1] == {"query": "本地餐饮", "maxItems": 3}
+    with connect() as conn:
+        red = conn.execute(
+            "SELECT a.current_name,p.title FROM catering_watch.posts p JOIN catering_watch.accounts a ON a.id=p.account_id WHERE p.project_key=%s AND p.platform='xiaohongshu'",
+            (project,),
+        ).fetchone()
+    assert red == {"current_name": "red", "title": "团餐菜单"}

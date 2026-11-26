@@ -11,6 +11,10 @@ class ApifyError(RuntimeError):
     pass
 
 
+def safe_error(exc):
+    return str(exc) if isinstance(exc, ApifyError) else type(exc).__name__
+
+
 class StartRejected(ApifyError):
     """The provider rejected the request before creating a run."""
 

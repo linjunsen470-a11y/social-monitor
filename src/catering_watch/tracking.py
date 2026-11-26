@@ -103,8 +103,8 @@ class Budget:
         self.execute = execute
         self.steps = []
 
-    def request(self, platform, payload, limit):
-        adapter = ADAPTERS[platform]()
+    def request(self, platform, payload, limit, *, adapter=None):
+        adapter = adapter or ADAPTERS[platform]()
         unit = adapter.item_price(payload["operation"])
         cost = (Decimal(str(adapter.start_fee)) + unit * limit).quantize(
             Decimal(".0001"), rounding=ROUND_CEILING

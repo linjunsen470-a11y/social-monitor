@@ -19,3 +19,12 @@ dist/
 .DS_Store
 .idea/
 .vscode/
+
+# Local cloud credentials and research captures
+.envrc
+.pgpass
+.pg_service.conf
+secrets/
+data/raw/
+data/replays/
+~$*.xlsx

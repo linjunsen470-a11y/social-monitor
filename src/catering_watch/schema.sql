@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS catering_watch.tracked_accounts (
   evidence_url text, synced_at timestamptz, next_cursor text, backfill_done boolean NOT NULL DEFAULT false,
   PRIMARY KEY(project_key,brand,platform,stable_id)
 );
+CREATE TABLE IF NOT EXISTS catering_watch.research_reports (
+  id uuid PRIMARY KEY, project_key text NOT NULL REFERENCES catering_watch.projects,
+  created_at timestamptz NOT NULL DEFAULT now(), evidence jsonb NOT NULL
+);
 CREATE TABLE IF NOT EXISTS catering_watch.post_aliases (
  project_key text REFERENCES catering_watch.projects, platform text, kind text, value text,
  canonical_id text NOT NULL, PRIMARY KEY(project_key,platform,kind,value)

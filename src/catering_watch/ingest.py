@@ -66,6 +66,11 @@ def clean(value):
         public_ids = {"modal_id", "id", "note_id"}
         if u.hostname in {"channels.weixin.qq.com", "finder.video.qq.com"}:
             public_ids.update(("channelId", "finderUserName", "username"))
+        if (
+            u.hostname == "channels.weixin.qq.com"
+            and u.path.rstrip("/") == "/finder-preview/pages/feed"
+        ):
+            public_ids.add("eid")
         keep = [(k, v) for k, v in parse_qsl(u.query) if k in public_ids]
         return urlunsplit((u.scheme, u.hostname or "", u.path, urlencode(keep), ""))
     return value
@@ -93,7 +98,7 @@ REPLAY_FIELDS = set(
  aweme_id description publish_time video_duration_ms cover_image_url share_url author_name author_sec_user_id
  author_user_id author_profile_url verification_text author_custom_verify author_enterprise_verify_reason
  enterprise_verify_reason docID hashDocID exportId channelId finderUserName username creatorName source
- title image url creatorUrl publishedAt pubTime duration note_id note_url note_type type summary content
+ title image url shareUrl creatorUrl publishedAt pubTime duration note_id note_url note_type type summary content
  user_id sec_user_id nickname profile_url author_douyin_id author_red_id page_next_page_token page_has_more
  collection_run_id like_count digg_count comment_count share_count collect_count liked_count collected_count
  likes comments shares favorites topics hashtags is_top is_pinned is_ad verification_type
@@ -128,7 +133,7 @@ def replay_fields(row, operation=None):
         result["image"] = result.get("image") or cover_url(cover)
     if isinstance(media, dict) and media.get("videoPlayLen") is not None:
         result["duration"] = result.get("duration") or media["videoPlayLen"]
-    return result
+    return {k: v for k, v in result.items() if v not in (None, "", {}, [])}
 
 
 def key_for(actor, payload, build):
@@ -178,6 +183,7 @@ def claim(platform, actor, payload, build, cap, floor):
                         "build": build,
                         "request_cap_usd": str(cap),
                         "query": payload.get("keyword")
+                        or payload.get("query")
                         or next(iter(payload.get("keywords", [])), None),
                     }
                 ),
@@ -208,7 +214,7 @@ class DurableClient:
             client = ApifyClient()
         if new:
             try:
-                run = client.start(actor, payload, cap, build)
+                run = client.start(actor, self.adapter.actor_input(payload), cap, build)
                 provider = run["id"]
             except StartRejected as exc:
                 with connect() as db:
@@ -256,7 +262,14 @@ class DurableClient:
                         (
                             rid,
                             offset,
-                            Jsonb([replay_fields(item, payload["operation"]) for item in rows]),
+                            Jsonb(
+                                [
+                                    replay_fields(
+                                        self.adapter.prepare_row(item), payload["operation"]
+                                    )
+                                    for item in rows
+                                ]
+                            ),
                         ),
                     )
                     offset += len(rows)
