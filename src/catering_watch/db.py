@@ -56,7 +56,7 @@ def upsert_account(
           (project_key,platform,platform_account_id,current_name,profile_url,verification_text,bio,source_metadata)
           VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
           ON CONFLICT(project_key,platform,platform_account_id) DO UPDATE SET
-            current_name=COALESCE(EXCLUDED.current_name,catering_watch.accounts.current_name),
+            current_name=COALESCE(NULLIF(EXCLUDED.current_name,''),catering_watch.accounts.current_name),
             profile_url=COALESCE(EXCLUDED.profile_url,catering_watch.accounts.profile_url),
             verification_text=COALESCE(EXCLUDED.verification_text,catering_watch.accounts.verification_text),
             bio=COALESCE(EXCLUDED.bio,catering_watch.accounts.bio),last_seen_at=now(),
@@ -82,6 +82,10 @@ def upsert_account(
         return int(row["id"])
 
 
+def channels_post_aliases(raw):
+    return {k: str(raw[k]) for k in ("docID", "videoId", "hashDocID", "exportId") if raw.get(k)}
+
+
 def upsert_post(post: dict) -> int:
     account_id = post.get("account_id")
     if not account_id and post.get("author_id"):
@@ -97,26 +101,13 @@ def upsert_post(post: dict) -> int:
     with connect() as conn:
         if post["platform"] == "channels":
             raw = post.get("metadata", {}).get("raw_payload", {})
-            aliases = {
-                k: str(raw[k]) for k in ("docID", "videoId", "hashDocID", "exportId") if raw.get(k)
-            }
+            aliases = channels_post_aliases(raw)
             if aliases:
                 conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
                     (settings.project_key + ":channels-alias",),
                 )
-                known = set()
-                for kind, value in aliases.items():
-                    row = conn.execute(
-                        """SELECT canonical_id FROM catering_watch.post_aliases
-                        WHERE project_key=%s AND platform='channels' AND kind=%s AND value=%s""",
-                        (settings.project_key, kind, value),
-                    ).fetchone()
-                    if row:
-                        known.add(row["canonical_id"])
-                if len(known) > 1:
-                    raise ValueError("视频号 ID 别名冲突，需核对")
-                post = dict(post, post_id=next(iter(known), post["post_id"]))
+                post = dict(post, post_id=channels_post_id(conn, aliases, post["post_id"]))
                 for kind, value in aliases.items():
                     conn.execute(
                         """INSERT INTO catering_watch.post_aliases VALUES(%s,'channels',%s,%s,%s)
@@ -137,7 +128,9 @@ def upsert_post(post: dict) -> int:
             cover_url=COALESCE(EXCLUDED.cover_url,catering_watch.posts.cover_url),
             duration_seconds=COALESCE(EXCLUDED.duration_seconds,catering_watch.posts.duration_seconds),
             content_hash=COALESCE(EXCLUDED.content_hash,catering_watch.posts.content_hash),
-            metadata=catering_watch.posts.metadata || EXCLUDED.metadata,last_seen_at=now(),last_checked_at=now()
+            metadata=catering_watch.posts.metadata || EXCLUDED.metadata || jsonb_build_object('raw_payload',
+                coalesce(catering_watch.posts.metadata->'raw_payload','{}'::jsonb) ||
+                coalesce(EXCLUDED.metadata->'raw_payload','{}'::jsonb)),last_seen_at=now(),last_checked_at=now()
           RETURNING id""",
             (
                 settings.project_key,
@@ -258,8 +251,22 @@ def get_posts_by_ids(ids):
         ).fetchall()
 
 
-def stored_post(platform, post_id):
+def channels_post_id(conn, aliases, default):
+    known = conn.execute(
+        """SELECT DISTINCT canonical_id FROM catering_watch.post_aliases
+           WHERE project_key=%s AND platform='channels'
+             AND (kind,value) IN (SELECT key,value FROM jsonb_each_text(%s))""",
+        (settings.project_key, Jsonb(aliases)),
+    ).fetchall()
+    if len(known) > 1:
+        raise ValueError("视频号 ID 别名冲突，需核对")
+    return known[0]["canonical_id"] if known else default
+
+
+def stored_post(platform, post_id, raw=None):
     with connect() as conn:
+        if platform == "channels" and raw:
+            post_id = channels_post_id(conn, channels_post_aliases(raw), post_id)
         return conn.execute(
             POST_SELECT + " AND p.platform=%s AND p.platform_post_id=%s",
             (settings.project_key, platform, post_id),

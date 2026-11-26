@@ -430,7 +430,7 @@ def test_channels_account_aliases_and_full_page(project, monkeypatch):
     assert candidate["id"] == "channel"
     ids = tracking.sync("测试品牌", "channels", "channel", budget, 1, cli._persist)
     assert len(set(ids)) == 2
-    assert db.stored_post("channels", "docID:doc")["id"] == ids[0]
+    assert db.stored_post("channels", "hashDocID:shared", {"hashDocID": "shared"})["id"] == ids[0]
     with connect() as conn:
         (brand,) = tracking.catalog_for(conn, [])
     assert all(
@@ -653,7 +653,7 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
             "channels",
             "videoDetail",
             "export/x",
-            [{"videoId": "vid", "username": "wx-id", "nickname": brand}],
+            [{"videoId": "vid", "username": "wx-id", "nickname": brand, "title": ""}],
         ),
         (
             "douyin",
@@ -769,41 +769,3 @@ def test_research_online_budget_and_actor_protocol(project, monkeypatch, tmp_pat
             (project,),
         ).fetchone()
     assert red == {"current_name": "red", "title": "团餐菜单"}
-
-
-def test_reproject_legacy_search_dataset_without_new_run(project):
-    from catering_watch.research_adapters import PublicRednote
-    from psycopg.types.json import Jsonb
-
-    class Search:
-        starts = 0
-
-        def start(self, actor, payload, cap, build):
-            self.starts += 1
-            return {
-                "id": "old",
-                "status": "SUCCEEDED",
-                "defaultDatasetId": "old-data",
-                "usageTotalUsd": 0.01,
-            }
-
-        def page(self, dataset, offset, limit):
-            assert dataset == "old-data" and offset == 0
-            return [{"user": {"userid": "u", "nickname": "n"}, "id": "abc", "type": "normal"}]
-
-    adapter = PublicRednote()
-    provider = Search()
-    client = ingest.DurableClient(adapter, provider)
-    args = (adapter.actor, adapter.search_payload("餐饮", 1), ".015")
-    run, _ = client.run(*args)
-    with connect() as conn:
-        conn.execute(
-            "UPDATE catering_watch.fetch_runs SET metadata=metadata-'mapped_search_rows' WHERE id=%s",
-            (run["fetch_id"],),
-        )
-        conn.execute(
-            "UPDATE catering_watch.dataset_pages SET items=%s WHERE fetch_id=%s",
-            (Jsonb([{"type": "normal"}]), run["fetch_id"]),
-        )
-    hit, [post] = client.run(*args)
-    assert provider.starts == 1 and hit["command_cost_usd"] == 0 and post["note_id"] == "abc"

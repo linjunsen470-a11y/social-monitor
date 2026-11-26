@@ -3,6 +3,10 @@
 from .adapters import DouyinAdapter, XiaohongshuAdapter
 
 
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
 class PublicSearch:
     def actor_input(self, payload):
         return {k: v for k, v in payload.items() if k != "operation"}
@@ -18,9 +22,10 @@ class PublicDouyin(PublicSearch, DouyinAdapter):
 
     def prepare_row(self, row):
         # Also supports the flat and authorMeta variants of archived batch searches.
-        author = row.get("author") or {}
-        meta = row.get("authorMeta") or {}
+        author = as_dict(row.get("author"))
+        meta = as_dict(row.get("authorMeta"))
         return {
+            **row,
             "aweme_id": row.get("aweme_id") or (row.get("id") if meta else None),
             "description": row.get("description")
             or row.get("desc")
@@ -35,11 +40,14 @@ class PublicDouyin(PublicSearch, DouyinAdapter):
             or meta.get("secUid"),
             "author_user_id": row.get("author_user_id") or author.get("uid") or meta.get("id"),
             "verification_text": row.get("verification_text")
+            or row.get("author_enterprise_verify_reason")
+            or row.get("enterprise_verify_reason")
             or author.get("enterprise_verify_reason")
+            or row.get("author_custom_verify")
             or meta.get("verificationReason"),
             "share_url": row.get("share_url") or row.get("shareUrl") or row.get("url"),
             "video_duration_ms": row.get("video_duration_ms")
-            or (row.get("video") or {}).get("duration"),
+            or as_dict(row.get("video")).get("duration"),
         }
 
 
@@ -51,8 +59,8 @@ class PublicRednote(PublicSearch, XiaohongshuAdapter):
     def prepare_row(self, row):
         if row.get("note_id"):
             return row
-        user = row.get("user") or {}
-        pid = row.get("id") if user else None
+        user = as_dict(row.get("user"))
+        pid = row.get("id")
         return {
             "note_id": pid,
             "note_url": f"https://www.xiaohongshu.com/explore/{pid}" if pid else None,
@@ -60,7 +68,7 @@ class PublicRednote(PublicSearch, XiaohongshuAdapter):
             "content": row.get("desc"),
             "note_type": row.get("type"),
             "author_name": user.get("nickname"),
-            "author_user_id": user.get("userid"),
+            "author_user_id": user.get("userid") or user.get("user_id"),
             "publish_time": row.get("timestamp"),
         }
 

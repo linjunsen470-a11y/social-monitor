@@ -119,13 +119,18 @@ class ChannelsAdapter(PlatformAdapter):
             operation, Decimal(".00400")
         )
 
-    def search_payload(self, q, n):
+    def actor_input(self, payload):
+        # The result limit affects the charge cap and cache key, not the Actor API.
+        return {k: v for k, v in payload.items() if k != "_limit"}
+
+    def search_payload(self, q, n, *, sort="latest", published="halfYear"):
         return {
             "operation": "videoSearch",
             "keywords": [q],
+            "_limit": n,
             "maxPages": 1,
-            "sortBy": "latest",
-            "publishTime": "halfYear",
+            "sortBy": sort,
+            "publishTime": published,
             "duration": "all",
         }
 

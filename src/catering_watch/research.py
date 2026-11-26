@@ -11,11 +11,11 @@ from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from psycopg.types.json import Jsonb
 
 from .adapters import ChannelsAdapter, channels_account_ids
-from .apify import ApifyError
+from .apify import ApifyError, safe_error
 from .config import settings
 from .db import connect, stored_post
 from .ingest import clean, replay_fields
-from .matrix import CATALOG, ownership, search_terms
+from .matrix import CATALOG, ownership, search_outcome, search_terms
 from .research_adapters import PEER_SEARCH
 from .tracking import catalog_for
 
@@ -62,8 +62,16 @@ class Research:
         self.archive = None
         if replay is not None:
             self.archive = {}
-            for entry in replay:
+            for index, entry in enumerate(replay, start=1):
+                if not isinstance(entry, dict) or not all(
+                    isinstance(entry.get(k), str) and entry[k].strip()
+                    for k in ("platform", "operation", "query", "run_id")
+                ):
+                    raise ValueError(f"回放第 {index} 条需要 platform、operation、query 和 run_id")
                 key = (entry["platform"], entry["operation"], entry["query"])
+                rows = entry.get("rows")
+                if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+                    raise ValueError(f"回放第 {index} 条的 rows 须为对象数组")
                 if key in self.archive:
                     raise ValueError(f"重复的回放检索 {key}")
                 self.archive[key] = entry
@@ -91,7 +99,7 @@ class Research:
                 run, rows = self.budget.request(platform, payload, limit, adapter=adapter)
             except (ApifyError, httpx.HTTPError) as exc:
                 # Keep successful platforms available. Never log a signed URL or token.
-                check["status"] = f"采集失败 ({type(exc).__name__})"
+                check["status"] = f"采集失败 ({safe_error(exc)})"
                 self.incomplete = True
                 return []
             if not run:
@@ -100,6 +108,20 @@ class Research:
                 return []
             check.update(run_id=run["id"], charged_or_held_usd=str(run["command_cost_usd"]))
         items = [item for r in rows[:limit] if (item := adapter.normalize(r))]
+        if self.archive is None and operation in ("videoSearch", "public_post_search"):
+            with connect() as db:
+                db.execute(
+                    "UPDATE catering_watch.fetch_runs SET metadata=metadata || %s WHERE id=%s",
+                    (
+                        Jsonb(
+                            {
+                                "run_id": run["id"],
+                                "outcome": search_outcome(term, items, len(rows[:limit])),
+                            }
+                        ),
+                        run["fetch_id"],
+                    ),
+                )
         for item in items:
             item.raw["collection_run_id"] = check["run_id"]
         check["status"] = "有候选" if items else "已查无结果"
@@ -116,13 +138,7 @@ class Research:
         brands = {}
         terms = review.get("terms", {})
         for query in dict.fromkeys(queries):
-            payload = {
-                "operation": "videoSearch",
-                "keywords": [query],
-                "maxPages": 1,
-                "sortBy": "relevance",
-                "publishTime": "all",
-            }
+            payload = channels.search_payload(query, limit, sort="relevance", published="all")
             for item in self.lookup(channels, "videoSearch", query, payload, limit):
                 eid = item.raw.get("exportId")
                 if selected is not None and eid not in selected:
@@ -132,9 +148,16 @@ class Research:
                     continue
                 brand = selected[eid] if selected is not None else item.author_name
                 sources[key] = (brand, item, query)
-        if selected is not None and set(selected) - sources.keys():
+        missing = set(selected or {}) - sources.keys()
+        if missing:
             self.checks.append(
-                {"status": "缺少所选作品", "count": len(set(selected) - sources.keys())}
+                {
+                    "platform": "channels",
+                    "operation": "videoSearch",
+                    "query": ", ".join(sorted(missing)),
+                    "status": "缺少所选作品",
+                    "count": len(missing),
+                }
             )
             self.incomplete = True
 
@@ -144,7 +167,7 @@ class Research:
             search_run = item.raw["collection_run_id"]
             detail_run = None
             if self.archive is None and not item.author_id:
-                previous = stored_post("channels", item.post_id)
+                previous = stored_post("channels", item.post_id, item.raw)
                 if previous and previous["author_id"]:
                     item.author_id = previous["author_id"]
                     if not item.author_name:
@@ -168,7 +191,7 @@ class Research:
                         self.incomplete = True
                     else:
                         detail_run = detail.raw["collection_run_id"]
-                        raw = {**item.raw, **{k: v for k, v in detail.raw.items() if v is not None}}
+                        raw = item.raw | replay_fields(detail.raw)
                         if detail.title:
                             raw["title"] = detail.title
                         item = channels.normalize(raw)
@@ -289,8 +312,11 @@ def export_report(report_id, output: Path):
             for cell in tab[tab.max_row]:
                 if isinstance(cell.value, str):
                     cell.data_type = "s"
-                    if cell.value.startswith(("https://", "http://")) and not any(
-                        c.isspace() for c in cell.value
+                    if (
+                        headers[cell.column - 1]
+                        in {"公开链接", "人工核对链接", "样本作品链接", "公开依据", "自营依据"}
+                        and cell.value.startswith(("https://", "http://"))
+                        and not any(c.isspace() for c in cell.value)
                     ):
                         cell.hyperlink = cell.value
                         cell.style = "Hyperlink"

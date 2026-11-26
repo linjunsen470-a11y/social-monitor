@@ -34,7 +34,7 @@ cp .env.example .env
 
 在环境的依赖安装步骤运行 `python -m pip install -e ".[test]"`。将密钥保存在专用环境的受控凭据配置中，并确认任务执行阶段可以读取它们。仅在 setup 阶段可见的 secret 不能为随后启动的 CLI 提供鉴权。避免在 setup 中打印凭据或把它们落入工作树。允许任务访问 Neon 数据库端点的 PostgreSQL TLS 端口及 `api.apify.com` 的 HTTPS 端口。
 
-首次安装或从旧版升级时，使用建表角色执行一次 `competitor-watch init-db`，创建调研快照表并授权，随后切回运行角色。在同一任务环境中运行 `competitor-watch doctor`、`competitor-watch db-status`、`competitor-watch doctor --check-apify`。最后一条仅做真实鉴权。
+首次安装或从旧版升级时，使用建表角色执行一次 `competitor-watch init-db`，创建调研快照表并授权，随后切回运行角色。在同一任务环境中运行 `competitor-watch doctor`、`competitor-watch db-status`、`competitor-watch doctor --check-apify`。普通 `doctor` 验证数据库，可用于只做回放的环境；加 `--check-apify` 后还会验证真实 Apify 凭据。
 
 ## 从微信关键词生成竞品调研表
 
@@ -47,7 +47,7 @@ competitor-watch research-report <调研UUID> --output outputs/research-copy.xls
 
 `research` 逐词搜索微信作品，在同一预算内补查缺少账号 ID 的作品，再按发布者昵称或人工选定品牌检索抖音和小红书。每词最多取 `--max-items` 行，每个品牌每端最多取 `--peer-items` 行，整项任务最多补查 `--max-details` 条详情。详情通过请求中的作品标识关联。搜索结果保留原始检索词、作品 ID、昵称、平台链接和运行 ID。微信预览链接能否播放受平台和客户端影响。
 
-Excel 包含竞品三端核查、微信视频作品、跨平台作品证据、策略观察及检索记录。自营判断沿用目录中的认证主体和有公开依据的账号映射，其他检索命中保留为候选。策略观察统计命中采购相关用语的作品并列出样本。部分失败、预算跳过或缺少回放记录时，命令保存已有证据并返回非零退出码。成功查询且结果为空会单独标记。打印的调研 UUID 可用于重新导出当次 Neon 快照。
+Excel 包含竞品三端核查、微信视频作品、跨平台作品证据、策略观察及检索记录。自营判断沿用目录中的认证主体和有公开依据的账号映射，其他检索命中保留为候选。策略观察统计命中采购相关用语的作品并列出样本。部分失败、预算跳过或缺少回放记录时，命令保存已有证据并返回非零退出码。成功查询且结果为空会单独标记。全失败时也会打印调研 UUID，原有 Excel 保留。可使用该 UUID 另行导出失败记录或重新导出成功快照。
 
 ### 回放历史数据与人工核对
 

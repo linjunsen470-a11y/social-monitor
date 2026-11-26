@@ -166,10 +166,10 @@ def test_search_observation_types():
 
     general = SimpleNamespace(author_name="商家", title="盒饭", body=None)
     clue = SimpleNamespace(author_name="广东辉豪餐饮", title="盒饭", body=None)
-    assert cli._search_outcome("侯宝贝", [], 0) == "empty"
-    assert cli._search_outcome("侯宝贝", [], 1) == "sparse"
-    assert cli._search_outcome("侯宝贝", [general], 1) == "no_relevant"
-    assert cli._search_outcome("侯宝贝", [clue], 1) == "candidate"
+    assert cli.search_outcome("侯宝贝", [], 0) == "empty"
+    assert cli.search_outcome("侯宝贝", [], 1) == "sparse"
+    assert cli.search_outcome("侯宝贝", [general], 1) == "no_relevant"
+    assert cli.search_outcome("侯宝贝", [clue], 1) == "candidate"
 
 
 def test_three_owned_platforms_can_publish_different_videos():

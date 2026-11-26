@@ -10,7 +10,7 @@ def configured_token():
         (
             value
             for name in ("APIFY_TOKEN", "APIFY_API_KEY")
-            if (value := os.getenv(name)) and "<" not in value
+            if (value := os.getenv(name, "").strip()) and "<" not in value
         ),
         "",
     )
@@ -18,12 +18,12 @@ def configured_token():
 
 runtime_token = configured_token()
 local_env = Path.cwd() / ".env"
-load_dotenv(local_env if local_env.is_file() else None)
+load_dotenv(local_env)
 
 
 @dataclass(frozen=True)
 class Settings:
-    database_url: str = os.getenv("DATABASE_URL", "")
+    database_url: str = os.getenv("DATABASE_URL", "").strip()
     apify_token: str = runtime_token or configured_token()
     project_key: str = os.getenv("PROJECT_KEY", "guangzhou_catering_competitors")
     max_cost_usd: float = float(os.getenv("MAX_COST_USD", "1.00"))
