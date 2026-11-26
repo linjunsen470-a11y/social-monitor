@@ -6,7 +6,7 @@ import pytest
 from typer.testing import CliRunner
 
 from catering_watch import cli
-from catering_watch.matrix import CATALOG, historical_checks, reports
+from catering_watch.matrix import CATALOG, assemble_report, reports
 
 BRAND = next(b for b in CATALOG if b["name"] == "侯宝贝")
 
@@ -64,16 +64,12 @@ def test_generic_caption_and_cover():
     assert not reports("reposts", posts, [], [BRAND])[0]["channels"]
 
 
-def test_first_run_evidence():
-    now = datetime(2026, 11, 26, 12, tzinfo=timezone.utc)
-    checks = historical_checks(now.replace(month=5), now)
-    rows = {r["competitor"]: r for r in reports("coverage", [post("douyin")], checks)}
-    assert rows["侯宝贝"]["owned_platform_count"] == 1
-    assert rows["侯宝贝"]["channels"] == rows["侯宝贝"]["xiaohongshu"] == "归属待核实"
-    assert rows["餐团团"]["douyin"] == "已查未检出"
-    assert rows["餐团团"]["channels"] == "数据不足"
-    assert rows["餐团团"]["channels_checks"][0]["source_url"]
-    assert not historical_checks(now.replace(year=2027), now.replace(year=2028))
+def test_empty_project_starts_with_no_observations():
+    end = datetime(2026, 11, 26, 12, tzinfo=timezone.utc)
+    window = {"start": end.replace(month=5), "finish": end}
+    for row in assemble_report("coverage", [], [], window):
+        assert row["owned_platform_count"] == 0
+        assert all(row[p] == "尚未查询" for p in ("douyin", "channels", "xiaohongshu"))
 
 
 def test_failed_and_unsearched():
@@ -143,19 +139,22 @@ def test_wheel_contains_runnable_cli_and_catalog(tmp_path):
 
 
 def test_cache_hit_reuses_posts_without_actor(monkeypatch):
-    def unexpected_actor():
-        pytest.fail("cached query attempted to create a paid client")
+    from catering_watch.adapters import ChannelsAdapter, DouyinAdapter
+    from catering_watch.ingest import key_for
 
-    class CachedAdapter:
-        actor = "cached"
+    monkeypatch.setenv("APIFY_BUILD", "test-build")
+    adapter = ChannelsAdapter()
+    expected = key_for(adapter.actor, adapter.search_payload("侯宝贝", 1), "test-build")
 
-        def __new__(cls):
-            return unexpected_actor()
+    def cached(fingerprint):
+        assert fingerprint == expected
+        return {"result_count": 1, "metadata": {"post_db_ids": [17]}}
 
     row = dict(post("channels"), id=17, cover_url=None)
-    monkeypatch.setattr(cli, "ADAPTERS", {"douyin": CachedAdapter, "channels": CachedAdapter})
+    monkeypatch.setattr(cli, "ADAPTERS", {"douyin": DouyinAdapter, "channels": ChannelsAdapter})
+    monkeypatch.setattr(cli, "find_cached_fetch", cached)
     monkeypatch.setattr(
-        cli, "find_cached_fetch", lambda fp: {"result_count": 1, "metadata": {"post_db_ids": [17]}}
+        cli.tracking.Budget, "request", lambda *a: pytest.fail("unexpected Actor call")
     )
     monkeypatch.setattr(cli, "get_posts_by_ids", lambda ids: [row] if ids == [17] else [])
     result = cli._cross_search("douyin", "侯宝贝", 1, 0.1)
@@ -184,8 +183,6 @@ def test_three_owned_platforms_can_publish_different_videos():
 
 
 def test_unknown_time_and_historical_seeds_do_not_add_coverage():
-    from catering_watch.matrix import assemble_report
-
     start = datetime(2026, 5, 26, tzinfo=timezone.utc)
     finish = datetime(2026, 11, 26, tzinfo=timezone.utc)
     posts = [
@@ -194,7 +191,7 @@ def test_unknown_time_and_historical_seeds_do_not_add_coverage():
     ]
     rows = {
         r["competitor"]: r
-        for r in assemble_report("coverage", posts, [], {"start": start, "finish": finish}, "test")
+        for r in assemble_report("coverage", posts, [], {"start": start, "finish": finish})
     }
     assert rows["侯宝贝"]["channels"] == "数据不足"
     assert rows["侯宝贝"]["owned_platform_count"] == 0

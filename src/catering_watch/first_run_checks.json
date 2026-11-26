@@ -1,7 +1,0 @@
-[
-  ["多哆团餐","channels","grouped"],["吉第餐饮","channels","grouped"],
-  ["餐团团","xiaohongshu","candidate"],["中膳世家","channels","candidate"],
-  ["餐团团","douyin","empty"],["餐团团","channels","sparse"],
-  ["中膳世家","douyin","candidate"],["中膳世家","xiaohongshu","empty"],
-  ["侯宝贝","channels","candidate"],["侯宝贝","xiaohongshu","candidate"]
-]

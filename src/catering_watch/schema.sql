@@ -38,8 +38,8 @@ CREATE TABLE IF NOT EXISTS catering_watch.fetch_runs (
   id bigserial PRIMARY KEY, project_key text NOT NULL REFERENCES catering_watch.projects(project_key),
   platform text NOT NULL, operation text NOT NULL, input_fingerprint text NOT NULL, status text NOT NULL,
   started_at timestamptz NOT NULL DEFAULT now(), finished_at timestamptz, result_count integer NOT NULL DEFAULT 0,
-  error_code text, error_message text, idempotency_key text NOT NULL,
-  metadata jsonb NOT NULL DEFAULT '{}'::jsonb, UNIQUE(project_key, idempotency_key)
+  error_code text, error_message text, reserved_usd numeric NOT NULL, provider_run_id text,
+  metadata jsonb NOT NULL DEFAULT '{}'::jsonb, UNIQUE(project_key, provider_run_id)
 );
 CREATE TABLE IF NOT EXISTS catering_watch.candidates (
   id bigserial PRIMARY KEY, project_key text NOT NULL REFERENCES catering_watch.projects(project_key),
@@ -77,11 +77,34 @@ CREATE TABLE IF NOT EXISTS catering_watch.review_queue (
   reason text NOT NULL, status text NOT NULL DEFAULT 'open', assigned_at timestamptz,
   resolved_at timestamptz, resolution text, UNIQUE(project_key, candidate_id, reason)
 );
+CREATE TABLE IF NOT EXISTS catering_watch.dataset_pages (
+  fetch_id bigint REFERENCES catering_watch.fetch_runs(id) ON DELETE CASCADE, page_offset integer,
+  items jsonb NOT NULL, PRIMARY KEY(fetch_id,page_offset)
+);
+CREATE TABLE IF NOT EXISTS catering_watch.tracked_accounts (
+  project_key text REFERENCES catering_watch.projects, brand text, platform text, stable_id text,
+  evidence_url text, synced_at timestamptz, next_cursor text, backfill_done boolean NOT NULL DEFAULT false,
+  PRIMARY KEY(project_key,brand,platform,stable_id)
+);
+CREATE TABLE IF NOT EXISTS catering_watch.post_aliases (
+ project_key text REFERENCES catering_watch.projects, platform text, kind text, value text,
+ canonical_id text NOT NULL, PRIMARY KEY(project_key,platform,kind,value)
+);
+
 CREATE INDEX IF NOT EXISTS idx_accounts_project_platform ON catering_watch.accounts(project_key, platform);
 CREATE INDEX IF NOT EXISTS idx_posts_project_platform_published ON catering_watch.posts(project_key, platform, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_posts_account_published ON catering_watch.posts(account_id, published_at DESC);
 CREATE INDEX IF NOT EXISTS idx_candidates_status ON catering_watch.candidates(project_key, status, last_seen_at DESC);
-CREATE INDEX IF NOT EXISTS idx_fetch_runs_idempotency ON catering_watch.fetch_runs(project_key, idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_fetch_runs_fingerprint ON catering_watch.fetch_runs(project_key, input_fingerprint);
 INSERT INTO catering_watch.projects(project_key, display_name)
 VALUES ('guangzhou_catering_competitors','广州及周边团餐配送竞品监测')
 ON CONFLICT (project_key) DO NOTHING;
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='catering_watch_app') THEN
+    GRANT USAGE ON SCHEMA catering_watch TO catering_watch_app;
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA catering_watch TO catering_watch_app;
+    GRANT USAGE ON ALL SEQUENCES IN SCHEMA catering_watch TO catering_watch_app;
+  END IF;
+END $$;
