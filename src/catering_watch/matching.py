@@ -1,5 +1,11 @@
-import re, unicodedata
+import re
+import unicodedata
+
 from rapidfuzz.fuzz import ratio
+
+from . import __version__
+
+COVER_DISTANCE_LIMIT = 8
 
 
 def normalize_text(value: str | None) -> str:
@@ -26,15 +32,25 @@ def distinctive(value, brand):
     return GENERIC.sub("", text)
 
 
-def repost_reasons(source, target, brand):
+def cover_distance(source, target):
     hashes = [p.get("cover_phash") for p in (source, target)]
     if not all(re.fullmatch(r"[0-9a-fA-F]{16}", h or "") for h in hashes):
-        return []
-    distance = (int(hashes[0], 16) ^ int(hashes[1], 16)).bit_count()
-    if distance > 8:
-        return []
+        return None
+    return (int(hashes[0], 16) ^ int(hashes[1], 16)).bit_count()
+
+
+def durations_compatible(source, target):
     a, b = [p.get("duration_seconds") for p in (source, target)]
-    if a and b and abs(float(a) - float(b)) > max(2, 0.05 * min(float(a), float(b))):
+    return not (a and b) or abs(float(a) - float(b)) <= max(2, 0.05 * min(float(a), float(b)))
+
+
+def repost_reasons(source, target, brand):
+    distance = cover_distance(source, target)
+    if (
+        distance is None
+        or distance > COVER_DISTANCE_LIMIT
+        or not durations_compatible(source, target)
+    ):
         return []
     left, right = (
         [distinctive(p.get(k), brand) for k in ("title", "body_text")] for p in (source, target)
@@ -44,7 +60,9 @@ def repost_reasons(source, target, brand):
     reasons = [
         f"封面指纹距离 {distance}/64",
         "独特文案高度相似",
-        "时长接近" if a and b else "时长缺失",
+        "时长接近"
+        if source.get("duration_seconds") and target.get("duration_seconds")
+        else "时长缺失",
     ]
     if source.get("published_at") and target.get("published_at"):
         gap = (target["published_at"] - source["published_at"]).total_seconds() / 3600
@@ -63,12 +81,14 @@ def compare_posts(a, b, brand=None):
 
     left, right = grams(a), grams(b)
     score = len(left & right) / max(1, len(left | right))
-    if not reasons and score >= 0.5:
-        relation = "metadata_review_candidate"
-        reasons = ["独特文案有重叠，整条重发证据不足"]
-    if not reasons and a.get("cover_phash") and a["cover_phash"] == b.get("cover_phash"):
-        relation = "metadata_review_candidate"
-        reasons = ["封面一致，独立文本或时长证据不足"]
+    if not reasons and durations_compatible(a, b):
+        distance = cover_distance(a, b)
+        if score >= 0.5:
+            reasons.append("独特文案有重叠，整条重发证据不足")
+        if distance is not None and distance <= COVER_DISTANCE_LIMIT:
+            reasons.append(f"封面指纹距离 {distance}/64，独立文本证据不足")
+        if reasons:
+            relation = "metadata_review_candidate"
     return {
         "relation": relation,
         "score": round(score, 3),
@@ -77,15 +97,27 @@ def compare_posts(a, b, brand=None):
     }
 
 
-def cover_feature(url):
-    import httpx, imagehash
+def cover_feature(url, platform=None):
     from io import BytesIO
+
+    import httpx
+    import imagehash
     from PIL import Image
 
     if not url:
         return None, "missing"
     try:
-        with httpx.stream("GET", url, timeout=12, follow_redirects=True) as response:
+        headers = {"User-Agent": f"catering-watch/{__version__}"}
+        referer = {
+            "douyin": "https://www.douyin.com/",
+            "channels": "https://channels.weixin.qq.com/",
+            "xiaohongshu": "https://www.xiaohongshu.com/",
+        }.get(platform)
+        if referer:
+            headers["Referer"] = referer
+        with httpx.stream(
+            "GET", url, headers=headers, timeout=12, follow_redirects=True
+        ) as response:
             if response.is_error:
                 return None, f"http_{response.status_code}"
             data = BytesIO()

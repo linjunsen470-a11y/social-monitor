@@ -1,7 +1,10 @@
-from pathlib import Path
 import json
+from pathlib import Path
+
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
 from .config import settings
 
 SCHEMA_SQL = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
@@ -34,19 +37,41 @@ def db_status():
         ).fetchone()
 
 
-def upsert_account(platform, account_id, name=None, url=None, verification=None, bio=None):
+def upsert_account(
+    platform, account_id, name=None, url=None, verification=None, bio=None, source_metadata=None
+):
     with connect() as conn:
+        if platform == "channels" and not (source_metadata or {}).get("channelId"):
+            # Feed rows often contain only username. Reuse the account identified by search.
+            known = conn.execute(
+                """SELECT platform_account_id FROM catering_watch.accounts WHERE project_key=%s
+                AND platform='channels' AND platform_account_id=source_metadata->>'channelId'
+                AND %s IN (source_metadata->>'finderUserName', source_metadata->>'username') LIMIT 2""",
+                (settings.project_key, str(account_id)),
+            ).fetchall()
+            if len(known) == 1:
+                account_id = known[0]["platform_account_id"]
         row = conn.execute(
             """INSERT INTO catering_watch.accounts
-          (project_key,platform,platform_account_id,current_name,profile_url,verification_text,bio)
-          VALUES (%s,%s,%s,%s,%s,%s,%s)
+          (project_key,platform,platform_account_id,current_name,profile_url,verification_text,bio,source_metadata)
+          VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
           ON CONFLICT(project_key,platform,platform_account_id) DO UPDATE SET
             current_name=COALESCE(EXCLUDED.current_name,catering_watch.accounts.current_name),
             profile_url=COALESCE(EXCLUDED.profile_url,catering_watch.accounts.profile_url),
             verification_text=COALESCE(EXCLUDED.verification_text,catering_watch.accounts.verification_text),
-            bio=COALESCE(EXCLUDED.bio,catering_watch.accounts.bio),last_seen_at=now()
+            bio=COALESCE(EXCLUDED.bio,catering_watch.accounts.bio),last_seen_at=now(),
+            source_metadata=catering_watch.accounts.source_metadata || EXCLUDED.source_metadata
           RETURNING id""",
-            (settings.project_key, platform, str(account_id), name, url, verification, bio),
+            (
+                settings.project_key,
+                platform,
+                str(account_id),
+                name,
+                url,
+                verification,
+                bio,
+                Jsonb(source_metadata or {}),
+            ),
         ).fetchone()
         if name:
             conn.execute(
@@ -67,11 +92,14 @@ def upsert_post(post: dict) -> int:
             post.get("author_url"),
             post.get("verification"),
             post.get("bio"),
+            post.get("author_identifiers"),
         )
     with connect() as conn:
         if post["platform"] == "channels":
             raw = post.get("metadata", {}).get("raw_payload", {})
-            aliases = {k: str(raw[k]) for k in ("docID", "hashDocID", "exportId") if raw.get(k)}
+            aliases = {
+                k: str(raw[k]) for k in ("docID", "videoId", "hashDocID", "exportId") if raw.get(k)
+            }
             if aliases:
                 conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))",
@@ -86,9 +114,36 @@ def upsert_post(post: dict) -> int:
                     ).fetchone()
                     if row:
                         known.add(row["canonical_id"])
+                # main used the first non-empty ID verbatim. Keep its post PK, features and matches.
+                legacy = conn.execute(
+                    """SELECT p.platform_post_id, p.metadata FROM catering_watch.posts p
+                    WHERE p.project_key=%s AND p.platform='channels' AND p.platform_post_id=ANY(%s)
+                    AND NOT EXISTS (SELECT 1 FROM catering_watch.post_aliases a
+                        WHERE a.project_key=p.project_key AND a.platform=p.platform
+                        AND a.canonical_id=p.platform_post_id)""",
+                    (settings.project_key, [v for k, v in aliases.items() if k != "videoId"]),
+                )
+                for old in legacy:
+                    pid = old["platform_post_id"]
+                    fields = set(old["metadata"].get("raw_actor_fields", [])) & {
+                        "docID",
+                        "hashDocID",
+                        "exportId",
+                    }
+                    if not fields or any(aliases.get(kind) == pid for kind in fields):
+                        known.add(pid)
                 if len(known) > 1:
                     raise ValueError("视频号 ID 别名冲突，需核对")
                 post = dict(post, post_id=next(iter(known), post["post_id"]))
+                if not known and post["post_id"] == aliases.get("docID"):
+                    # A bare legacy export/hash ID may occupy the new docID's spelling.
+                    occupied = conn.execute(
+                        """SELECT 1 FROM catering_watch.posts WHERE project_key=%s
+                        AND platform='channels' AND platform_post_id=%s""",
+                        (settings.project_key, post["post_id"]),
+                    ).fetchone()
+                    if occupied:
+                        post["post_id"] = f"docID:{post['post_id']}"
                 for kind, value in aliases.items():
                     conn.execute(
                         """INSERT INTO catering_watch.post_aliases VALUES(%s,'channels',%s,%s,%s)
@@ -129,15 +184,20 @@ def upsert_post(post: dict) -> int:
         return int(row["id"])
 
 
-def find_cached_fetch(key):
+def find_cached_fetch(keys):
     with connect() as conn:
         return conn.execute(
             """SELECT id,status,result_count,metadata,finished_at
-          FROM catering_watch.fetch_runs WHERE project_key=%s AND input_fingerprint=%s
+          FROM catering_watch.fetch_runs WHERE project_key=%s AND input_fingerprint=ANY(%s)
           AND status IN ('SUCCEEDED','SUCCEEDED_WITH_WARNINGS')
+          AND metadata ? 'post_db_ids'
           AND finished_at > now() - (%s || ' hours')::interval
           ORDER BY finished_at DESC LIMIT 1""",
-            (settings.project_key, key, str(settings.cache_ttl_hours)),
+            (
+                settings.project_key,
+                [keys] if isinstance(keys, str) else keys,
+                str(settings.cache_ttl_hours),
+            ),
         ).fetchone()
 
 

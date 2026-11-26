@@ -1,4 +1,7 @@
-from catering_watch.apify import ApifyClient
+import pytest
+import httpx
+
+from catering_watch.apify import ApifyClient, ApifyError, StartRejected
 
 class FakeResponse:
     def __init__(self, data, status_code=200):
@@ -35,3 +38,23 @@ def test_apify_run_uses_token_and_hard_cost_cap(monkeypatch):
     post=clients[0].calls[0]
     assert post[2]["maxTotalChargeUsd"] == "0.1000"
     assert "vendor~actor" in post[1]
+    assert clients[0].calls[1][2] == {"offset": 0, "limit": 100, "skipHidden": "true"}
+
+
+@pytest.mark.parametrize(
+    "status,rejected",
+    [(400, True), (401, True), (403, True), (422, True), (408, False), (500, False)],
+)
+def test_start_rejection_keeps_safe_provider_diagnostics(status, rejected):
+    def respond(request):
+        return httpx.Response(
+            status, json={"error": {"type": "invalid-input", "message": "private-input"}}
+        )
+
+    client = ApifyClient("test")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+        client.client = http
+        with pytest.raises(ApifyError, match="invalid-input") as error:
+            client.start("vendor/actor", {}, 0.1, "latest")
+    assert isinstance(error.value, StartRejected) is rejected
+    assert "private-input" not in str(error.value)

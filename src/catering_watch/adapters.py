@@ -1,13 +1,20 @@
 from __future__ import annotations
-from dataclasses import dataclass
+
 import re
-from .ingest import DurableClient, timestamp
+from dataclasses import dataclass
+from decimal import Decimal
+
+from .ingest import DurableClient, replay_fields, timestamp
 
 ACTORS = {
     "douyin": "socialdatax/socialdatax-douyin-data-api",
     "channels": "zen-studio/wechat-channels-scraper",
     "xiaohongshu": "socialdatax/socialdatax-xhs-data-api",
 }
+
+
+def channels_account_ids(row):
+    return {k: str(row[k]) for k in ("channelId", "finderUserName", "username") if row.get(k)}
 
 
 @dataclass
@@ -34,6 +41,9 @@ class PlatformAdapter:
 
     def __init__(self, client=None):
         self.client = client or DurableClient(self)
+
+    def item_price(self, operation):
+        return Decimal(str(self.price_per_item))
 
     def search(self, query: str, limit: int, max_cost_usd: float):
         run, rows = self.client.run(self.actor, self.search_payload(query, limit), max_cost_usd)
@@ -114,6 +124,12 @@ class ChannelsAdapter(PlatformAdapter):
     price_per_item = 0.00399
     start_fee = 0.05
 
+    def item_price(self, operation):
+        # Free-tier event plus the default dataset-item charge.
+        return {"channelSearch": Decimal(".00900"), "videoDetail": Decimal(".02500")}.get(
+            operation, Decimal(".00400")
+        )
+
     def search_payload(self, q, n):
         return {
             "operation": "videoSearch",
@@ -136,19 +152,21 @@ class ChannelsAdapter(PlatformAdapter):
         }
 
     def normalize(self, r):
+        if isinstance(r.get("media"), dict):
+            r = replay_fields(r)
         pid = r.get("docID") or next(
-            (f"{key}:{r[key]}" for key in ("hashDocID", "exportId") if r.get(key)), None
+            (f"{key}:{r[key]}" for key in ("videoId", "hashDocID", "exportId") if r.get(key)), None
         )
         if not pid:
             return None
-        source = r.get("source") or {}
-        published = r.get("publishedAt") or r.get("pubTime")
+        source = r["source"] if isinstance(r.get("source"), dict) else {}
+        published = r.get("publishedAt") or r.get("pubTime") or r.get("createTime")
         try:
-            parts = str(r.get("duration") or "").split(":")
+            parts = str(r.get("duration") or r.get("durationText") or "").split(":")
             duration = sum(float(x) * 60**i for i, x in enumerate(reversed(parts)))
         except (ValueError, TypeError):
             duration = None
-        title = r.get("title")
+        title = r.get("title") or r.get("description")
         return SearchResult(
             self.platform,
             str(pid),
@@ -157,8 +175,8 @@ class ChannelsAdapter(PlatformAdapter):
             title,
             title,
             r.get("image"),
-            r.get("creatorName") or source.get("title"),
-            r.get("channelId") or r.get("finderUserName"),
+            r.get("creatorName") or r.get("nickname") or source.get("title"),
+            next(iter(channels_account_ids(r).values()), None),
             r.get("creatorUrl"),
             duration,
             r,

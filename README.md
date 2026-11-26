@@ -78,16 +78,21 @@ competitor-watch report --kind reposts --format jsonl --output outputs/reposts.j
 
 ```bash
 # 新账号无需修改内置目录。昵称检索返回候选，选择其稳定 ID 后再登记。
-competitor-watch track-account "品牌名" douyin "账号昵称" --kind name
+competitor-watch track-account "品牌名" douyin "账号昵称" --kind name --max-cost 0.05
 competitor-watch track-account "品牌名" douyin "稳定账号ID" --execute
 competitor-watch discover-peers "品牌名" douyin --max-cost 0.30
 competitor-watch sync-account "品牌名" douyin "稳定账号ID" --max-items 20 --max-cost 0.20
+competitor-watch sync-account "品牌名" douyin "稳定账号ID" --backfill --max-items 50 --max-cost 0.30
 competitor-watch match-local --output outputs/local-matches.jsonl
 ```
 
-上述两个采集命令默认展示操作和额度。确认预算后加 `--execute`。登记自营关系时可提供 `--evidence-url` 指向公开证明；缺少证据的账号进入候选。抖音和小红书支持主页分享短链，视频号可用稳定 ID。抖音、小红书在返回分页游标时保存进度；视频号重访最新页。每次同步有作品数量上限，历史覆盖取决于平台公开返回的分页。重发报告的 `review_candidates` 单列值得复核的配对，自营计数仍要求两端归属及内容证据同时满足。
+采集命令默认展示操作和额度，加 `--execute` 后执行。昵称检索展示账号 ID、昵称、认证主体、简介、主页及可用的粉丝数。`discover-peers` 按品牌词筛出候选。`scan-url` 自动同步已登记账号或认证主体与目录企业全名完全一致的账号。其余候选可用 `track-account … --kind id --execute` 登记。登记表示愿意追踪，自营归属仍需公开认证主体或 `--evidence-url`。旧版没有证据链接的登记混合了人工选择和自动搜索结果，升级后会保留原记录和游标，重新登记后恢复追踪。
 
-`--max-cost` 限制单次命令。所有沙箱应使用相同的项目配置和 `DAILY_BUDGET_USD`，默认值为 `MAX_COST_USD`。项目按 UTC 自然日保守扣减每个新 run 的**请求上限**，跨日的未决任务继续占用额度。账本另存按事件价格估算的费用，最终结算以账单为准。可设置 `APIFY_BUILD` 选择三个 Actor 均支持的构建标签；默认 latest，共享成功缓存受 TTL 限制。
+抖音、小红书的日常同步从首页开始，在本次条数和预算内翻页。遇到已收录的非置顶作品或六个月窗口边界，会处理完当前页。加 `--backfill` 从保存的历史游标继续。若 Actor 只返回某页的一部分，回填会保留游标，需给足该页条数和额度后重试。视频号只支持最新页，返回的窗口内作品整页入库。无时区的 ISO 发布时间按上海时间解释。封面签名按采集时的原值保存，签名过期或旧缓存已丢失签名时，需要平台返回新链接才能补算指纹。
+
+`--max-cost` 限制单次命令。`DAILY_BUDGET_USD` 限制项目 UTC 日额度，默认值为 `MAX_COST_USD`。新 run 先预留请求上限。Apify 明确拒绝启动时释放预留。返回终态费用 `usageTotalUsd` 时按实收结算。缺少实收值时，账本标为估算，预算按请求上限保留至结算日结束。跨日未决 run 始终占用额度。缓存和续跑已有 run 无新增预留。`APIFY_BUILD` 默认为 latest。同参数的首页也受 `CACHE_TTL_HOURS` 控制，要提高采集频率需相应缩短 TTL。
+
+`init-db` 会给已存在的运行角色 `catering_watch_app` 授予三张新增表的读写权限。使用自定义运行角色时，由迁移角色为它授予相应权限。
 
 同一参数再次运行会读取已完成的 Dataset 页，或继续轮询已登记的 run。STARTING 或 RECONCILE 且缺少 provider_run_id 时，先在 Apify Console 核对同一账号、Actor、启动时间和输入。确认唯一对应后，运维可将该行的 provider_run_id 填入并将 status 更新为 RUNNING，然后重试原命令；无法确认时保持待核对。新版本生效前启动的 Actor 仍需人工核账。
 

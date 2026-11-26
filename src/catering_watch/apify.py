@@ -1,11 +1,19 @@
 from __future__ import annotations
+
+import re
 import time
+
 import httpx
+
 from .config import settings
 
 
 class ApifyError(RuntimeError):
     pass
+
+
+class StartRejected(ApifyError):
+    """The provider rejected the request before creating a run."""
 
 
 class ApifyClient:
@@ -37,7 +45,17 @@ class ApifyClient:
             json=payload,
         )
         if response.is_error:
-            raise ApifyError(f"Actor start: HTTP {response.status_code}")
+            error = f"Actor start: HTTP {response.status_code}"
+            # Error messages can echo signed input URLs. The error type is sufficient for diagnosis.
+            try:
+                code = response.json()["error"]["type"]
+                if isinstance(code, str) and re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", code):
+                    error += f" ({code})"
+            except (ValueError, TypeError, KeyError):
+                pass
+            if response.status_code in {400, 401, 402, 403, 404, 405, 413, 415, 422, 429}:
+                raise StartRejected(error)
+            raise ApifyError(error)
         return response.json()["data"]
 
     def status(self, provider):
@@ -47,7 +65,9 @@ class ApifyClient:
 
     def page(self, dataset, offset, limit):
         response = self.client.get(
-            f"{self.base}/datasets/{dataset}/items", params={"offset": offset, "limit": limit}
+            f"{self.base}/datasets/{dataset}/items",
+            # Keep empty rows: offsets and the end-of-dataset check count physical items.
+            params={"offset": offset, "limit": limit, "skipHidden": "true"},
         )
         if response.is_error:
             raise ApifyError(f"Dataset: HTTP {response.status_code}")

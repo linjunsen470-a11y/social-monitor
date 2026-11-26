@@ -1,28 +1,35 @@
 from __future__ import annotations
-import csv, json, hashlib, re
+
+import csv
+import hashlib
+import json
+import os
+import re
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
+
 import typer
 from rich import print
-from .config import settings
+
 from . import tracking
-from .ingest import clean, replay_fields
-from urllib.parse import urlsplit, parse_qs
+from .adapters import ADAPTERS, channels_account_ids, is_profile_reference
+from .apify import ApifyClient
+from .config import settings
 from .db import (
     connect,
-    init_db,
     db_status,
-    upsert_post,
     find_cached_fetch,
+    get_cover_phash,
     get_posts_by_ids,
+    init_db,
     save_candidate_match,
     save_cover_phash,
-    get_cover_phash,
+    stored_post,
+    upsert_post,
 )
-from .adapters import ADAPTERS, is_profile_reference
+from .ingest import clean, cover_url, key_for, replay_fields
 from .matching import compare_posts, cover_feature
-from .apify import ApifyClient
-from .db import stored_post
-from .matrix import REPORT_FIELDS, CATALOG, read_report, search_terms, seed_brand
+from .matrix import CATALOG, REPORT_FIELDS, read_report, search_terms, seed_brand
 
 app = typer.Typer(
     no_args_is_help=True, help="Agent-first three-platform competitor content research"
@@ -69,6 +76,7 @@ def _persist(item, video_search=False):
         or raw.get("enterprise_verify_reason")
     )
 
+    image_url = cover_url(item.cover_url)
     post_id = upsert_post(
         {
             "platform": item.platform,
@@ -77,17 +85,20 @@ def _persist(item, video_search=False):
             "published_at": item.published_at,
             "title": item.title,
             "body": item.body,
-            "cover_url": clean(item.cover_url),
+            "cover_url": image_url,
             "duration_seconds": item.duration_seconds,
             "author_name": item.author_name,
             "author_id": item.author_id,
+            "author_identifiers": channels_account_ids(raw)
+            if item.platform == "channels"
+            else None,
             "author_url": clean(item.author_url),
             "verification": verification if isinstance(verification, str) else None,
             "metadata": metadata,
         }
     )
 
-    _ensure_cover(post_id, item.cover_url, get_cover_phash(post_id))
+    _ensure_cover(post_id, image_url, get_cover_phash(post_id), item.platform)
     return post_id
 
 
@@ -104,10 +115,10 @@ def _export(rows):
         writer.writerows(rows)
 
 
-def _ensure_cover(post_id, url, existing):
+def _ensure_cover(post_id, url, existing, platform):
     if existing:
         return existing
-    value, status = cover_feature(url)
+    value, status = cover_feature(url, platform)
     with connect() as db:
         db.execute(
             """UPDATE catering_watch.posts SET metadata=metadata || jsonb_build_object('cover_status',%s::text) WHERE project_key=%s AND id=%s""",
@@ -132,110 +143,79 @@ def _search_outcome(query, items, raw_count):
 
 
 def _cross_search(source_platform, query, max_items, max_cost, source_post=None):
-    targets = [p for p in ADAPTERS if p != source_platform]
-    per_target = max_cost / len(targets)
+    budget = tracking.Budget(max_cost, execute=True)
+    build = os.getenv("APIFY_BUILD", "latest")
     output = []
-    for target in targets:
-        adapter_type = ADAPTERS[target]
-        fp = _fingerprint(target, adapter_type.actor, query, max_items, "half_year", "video")
-        cached = find_cached_fetch(fp)
-        if cached:
-            print(f"[cyan]CACHE HIT[/cyan] {target}: {cached['result_count']} rows; no Actor run")
-            cached_ids = (cached.get("metadata") or {}).get("post_db_ids", [])
-            cached_posts = get_posts_by_ids(cached_ids)
-            for row in cached_posts:
-                phash = row["cover_phash"] or (
-                    _ensure_cover(row["id"], row["cover_url"], None) if row["cover_url"] else None
-                )
-                match = None
-                if source_post:
-                    target_data = {
-                        "title": row["title"],
-                        "body_text": row["body_text"],
-                        "cover_phash": phash,
-                    }
-                    match = compare_posts(source_post, target_data)
-                    save_candidate_match(
-                        source_post["db_post_id"],
-                        int(row["id"]),
-                        match,
-                        source_post.get("url"),
-                        row["post_url"],
-                    )
-                output.append(
-                    {
-                        "platform": row["platform"],
-                        "post_id": row["platform_post_id"],
-                        "url": row["post_url"],
-                        "published_at": row["published_at"],
-                        "title": row["title"],
-                        "body": row["body_text"],
-                        "author_name": row["author_name"],
-                        "author_id": row["author_id"],
-                        "match": match,
-                        "cache_hit": True,
-                    }
-                )
-            continue
+    for target in (p for p in ADAPTERS if p != source_platform):
         try:
-            adapter = adapter_type()
-            run, items = adapter.search(query, max_items, per_target)
-            estimate = (
-                adapter.start_fee + run.get("raw_item_count", len(items)) * adapter.price_per_item
-            )
-            post_db_ids = []
-            for item in items:
-                item.raw["collection_run_id"] = run["id"]
-                target_db_id = _persist(item, video_search=True)
-                post_db_ids.append(target_db_id)
+            adapter = ADAPTERS[target]()
+            payload = adapter.search_payload(query, max_items)
+            keys = [key_for(adapter.actor, payload, build)]
+            if build == "latest":
+                # main stored normalized post IDs under its pre-PR scan fingerprint.
+                keys.append(
+                    _fingerprint(target, adapter.actor, query, max_items, "half_year", "video")
+                )
+            cached = find_cached_fetch(keys)
+            ids = cached["metadata"]["post_db_ids"] if cached else []
+            posts = get_posts_by_ids(ids)
+            cache_hit = bool(cached) and len(posts) == len(set(ids))
+            if cache_hit:
+                print(f"[cyan]CACHE HIT[/cyan] {target}，复用 {len(posts)} 条作品")
+            else:
+                run, raw = budget.request(target, payload, max_items)
+                if not run:
+                    print(f"{target} 预算不足，跳过检索")
+                    continue
+                items = [item for row in raw if (item := adapter.normalize(row))]
+                ids = []
+                for item in items:
+                    item.raw["collection_run_id"] = run["id"]
+                    ids.append(_persist(item, video_search=True))
+                posts = get_posts_by_ids(ids)
+                with connect() as db:
+                    db.execute(
+                        "UPDATE catering_watch.fetch_runs SET metadata=metadata || %s::jsonb WHERE id=%s",
+                        (
+                            json.dumps(
+                                {
+                                    "query": query,
+                                    "run_id": run["id"],
+                                    "outcome": _search_outcome(query, items, len(raw)),
+                                    "post_db_ids": ids,
+                                }
+                            ),
+                            run["fetch_id"],
+                        ),
+                    )
+                print(f"{target}，{len(posts)} 条作品，本次计入额度 ${run['command_cost_usd']:.4f}")
+            for post in posts:
+                if cache_hit and post["cover_url"] and not post["cover_phash"]:
+                    post["cover_phash"] = _ensure_cover(post["id"], post["cover_url"], None, target)
                 match = None
-                target_phash = get_cover_phash(target_db_id)
                 if source_post:
-                    target_data = {
-                        "title": item.title,
-                        "body_text": item.body,
-                        "cover_phash": target_phash,
-                    }
-                    match = compare_posts(source_post, target_data)
+                    match = compare_posts(source_post, post)
                     save_candidate_match(
                         source_post["db_post_id"],
-                        target_db_id,
+                        post["id"],
                         match,
                         source_post.get("url"),
-                        item.url,
+                        post["post_url"],
                     )
                 output.append(
                     {
-                        "platform": item.platform,
-                        "post_id": item.post_id,
-                        "url": clean(item.url),
-                        "published_at": item.published_at,
-                        "title": item.title,
-                        "body": item.body,
-                        "author_name": item.author_name,
-                        "author_id": item.author_id,
+                        "platform": post["platform"],
+                        "post_id": post["platform_post_id"],
+                        "url": post["post_url"],
+                        "published_at": post["published_at"],
+                        "title": post["title"],
+                        "body": post["body_text"],
+                        "author_name": post["author_name"],
+                        "author_id": post["author_id"],
                         "match": match,
+                        "cache_hit": cache_hit,
                     }
                 )
-            raw_count = run.get("raw_item_count", len(items))
-            with connect() as db:
-                db.execute(
-                    """UPDATE catering_watch.fetch_runs SET metadata=metadata || %s::jsonb WHERE id=%s""",
-                    (
-                        json.dumps(
-                            {
-                                "query": query,
-                                "run_id": run["id"],
-                                "outcome": _search_outcome(query, items, raw_count),
-                                "post_db_ids": post_db_ids,
-                            }
-                        ),
-                        run["fetch_id"],
-                    ),
-                )
-            print(
-                f"[green]{target}[/green]: {len(items)} rows; estimated event cost ${estimate:.4f}"
-            )
         except Exception as exc:
             print(f"[red]{target} failed[/red]: {exc}")
     return output
@@ -279,7 +259,7 @@ def db_status_command():
 def scan(
     platform: str = typer.Option(..., "--platform"),
     query: str = typer.Option(..., "--query"),
-    max_items: int = typer.Option(None, "--max-items"),
+    max_items: int = typer.Option(None, "--max-items", min=1),
     max_cost: float = typer.Option(None, "--max-cost"),
     execute: bool = typer.Option(False, "--execute"),
 ):
@@ -327,7 +307,9 @@ def scan_url(
         sources = [existing]
     else:
         run, raw = budget.request(source, payload, limit)
-        items = [item for row in raw if (item := adapter.normalize(row))][:limit]
+        items = [item for row in raw if (item := adapter.normalize(row))]
+        if not (profile and source == "channels"):
+            items = items[:limit]
         for item in items:
             item.raw["collection_run_id"] = run["id"]
         sources = get_posts_by_ids([_persist(i) for i in items])
@@ -342,7 +324,7 @@ def scan_url(
                 "queries": terms,
                 "operations": budget.steps,
                 "source_cached": bool(existing),
-                "sync": "按发现的账号和剩余额度同步",
+                "sync": "同步已登记账号及认证主体完全匹配的账号，其他候选供选择",
             }
         )
         return
@@ -352,6 +334,10 @@ def scan_url(
         return
     first = sources[0]
     brand = seed_brand(source, first["platform_post_id"])
+    if not brand:
+        brand = next(
+            (b for b in CATALOG if (query or first["author_name"]) in search_terms(b)), None
+        )
     name = (brand or {}).get("name") or query or first["author_name"]
     if not name:
         raise typer.BadParameter("源作品缺少账号名，请指定 --query")
@@ -359,19 +345,27 @@ def scan_url(
         if post["author_id"]:
             tracking.register(name, source, post["author_id"])
         if existing:
-            _ensure_cover(post["id"], post["cover_url"], post["cover_phash"])
+            _ensure_cover(post["id"], post["cover_url"], post["cover_phash"], source)
     terms = [query] if query else search_terms(brand) if brand else [name]
     peers = tracking.discover(name, source, terms, budget, max_items)
-    for platform, uid in peers:
-        _sync(name, platform, uid, budget, max_items)
+    with connect() as db:
+        catalog = tracking.catalog_for(db, CATALOG)
+    entry = next((b for b in catalog if b["name"] == name), {})
+    targets = {
+        (a["platform"], a["id"]) for a in entry.get("accounts", []) if a["platform"] != source
+    }
+    for peer in peers:
+        if peer["verification_text"] and peer["verification_text"] in (brand or {}).get(
+            "entities", []
+        ):
+            targets.add((peer["platform"], peer["id"]))
+    if peers:
+        print({"候选账号": peers})
+    for target, uid in sorted(targets):
+        tracking.sync(name, target, uid, budget, max_items, _persist)
     rows = [r for r in read_report("reposts") if r["competitor"] == name]
     _export(rows)
     print(budget.steps)
-
-
-def _sync(brand, platform, uid, budget, limit):
-    ids = tracking.sync(brand, platform, uid, budget, limit, _persist)
-    return ids
 
 
 def _budget(platform, max_cost, execute):
@@ -412,13 +406,16 @@ def track_account(
         if platform == "channels":
             query = parse_qs(parts.query)
             reference = next(
-                (query[k][0] for k in ("finderUserName", "username", "channelId") if query.get(k)),
-                None,
+                iter(channels_account_ids({k: v[0] for k, v in query.items()}).values()), None
             )
             if not reference:
                 raise typer.BadParameter("视频号链接未提供稳定账号 ID，请用 --kind name 查找")
         else:
-            reference = parts.path.rstrip("/").split("/")[-1]
+            prefix = "/user/" if platform == "douyin" else "/user/profile/"
+            match = re.match(re.escape(prefix) + r"([^/]+)(?:/|$)", parts.path)
+            if not match:
+                raise typer.BadParameter("主页链接缺少稳定账号 ID")
+            reference = match[1]
     elif kind != "id":
         raise typer.BadParameter("kind must be id, url or name")
     if execute:
@@ -448,9 +445,12 @@ def sync_account(
     max_items: int = typer.Option(20, min=1),
     execute: bool = False,
     max_cost: float = typer.Option(None),
+    backfill: bool = typer.Option(False, "--backfill", help="从保存的游标回填抖音或小红书历史作品"),
 ):
     budget = _budget(platform, max_cost, execute)
-    ids = _sync(brand, platform, account_id, budget, max_items)
+    if backfill and platform == "channels":
+        raise typer.BadParameter("视频号仅提供最新一页，无法按游标回填")
+    ids = tracking.sync(brand, platform, account_id, budget, max_items, _persist, backfill=backfill)
     print({"posts": len(ids), "operations": budget.steps})
 
 

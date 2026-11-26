@@ -4,9 +4,9 @@ import json
 import os
 from pathlib import Path
 
-from .tracking import catalog_for
-
+from .adapters import channels_account_ids
 from .matching import compare_posts
+from .tracking import catalog_for
 
 PLATFORMS = ("douyin", "channels", "xiaohongshu")
 CATALOG = json.loads(
@@ -50,16 +50,24 @@ def video_status(post):
     return None
 
 
+def account_matches(account, post):
+    if account["platform"] != post["platform"]:
+        return False
+    if post["platform"] != "channels":
+        return account["id"] == post["author_id"]
+    observed = channels_account_ids(post["metadata"].get("raw_payload", {}))
+    return not {post["author_id"], *observed.values()}.isdisjoint(
+        account.get("ids", [account["id"]])
+    )
+
+
 def ownership(brand, post):
     if not post["author_id"]:
         return None
     if post["verification_text"] and post["verification_text"] in brand.get("entities", []):
         return post["verification_text"]
     for account in brand.get("accounts", []):
-        if account.get("evidence_url") and (account["platform"], account["id"]) == (
-            post["platform"],
-            post["author_id"],
-        ):
+        if account.get("evidence_url") and account_matches(account, post):
             return account["evidence_url"]
     return None
 
@@ -73,10 +81,7 @@ def relates(brand, post):
     )
     text = " ".join(str(f) for f in fields if f).casefold()
     return (
-        any(
-            a["platform"] == post["platform"] and a["id"] == post["author_id"]
-            for a in brand.get("accounts", [])
-        )
+        any(account_matches(a, post) for a in brand.get("accounts", []))
         or ownership(brand, post)
         or post["platform_post_id"] in brand.get("seeds", {}).get(post["platform"], [])
         or any(term.casefold() in text for term in search_terms(brand))

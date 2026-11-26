@@ -91,15 +91,34 @@ ALTER TABLE catering_watch.fetch_runs ADD COLUMN IF NOT EXISTS reserved_usd nume
 ALTER TABLE catering_watch.fetch_runs ADD COLUMN IF NOT EXISTS provider_run_id text;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_run ON catering_watch.fetch_runs(project_key,provider_run_id);
 CREATE TABLE IF NOT EXISTS catering_watch.dataset_pages (
-  fetch_id bigint REFERENCES catering_watch.fetch_runs(id), page_offset integer,
+  fetch_id bigint REFERENCES catering_watch.fetch_runs(id) ON DELETE CASCADE, page_offset integer,
   items jsonb NOT NULL, PRIMARY KEY(fetch_id,page_offset)
 );
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid='catering_watch.dataset_pages'::regclass
+             AND conname='dataset_pages_fetch_id_fkey' AND confdeltype <> 'c') THEN
+    ALTER TABLE catering_watch.dataset_pages DROP CONSTRAINT dataset_pages_fetch_id_fkey,
+      ADD FOREIGN KEY (fetch_id) REFERENCES catering_watch.fetch_runs(id) ON DELETE CASCADE;
+  END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS catering_watch.tracked_accounts (
   project_key text REFERENCES catering_watch.projects, brand text, platform text, stable_id text,
   evidence_url text, synced_at timestamptz, PRIMARY KEY(project_key,brand,platform,stable_id)
 );
 ALTER TABLE catering_watch.tracked_accounts ADD COLUMN IF NOT EXISTS next_cursor text;
+-- Older unevidenced rows mix explicit registrations and automatic search hits.
+ALTER TABLE catering_watch.tracked_accounts ADD COLUMN IF NOT EXISTS confirmed boolean NOT NULL DEFAULT false;
+ALTER TABLE catering_watch.tracked_accounts ADD COLUMN IF NOT EXISTS backfill_done boolean NOT NULL DEFAULT false;
 CREATE TABLE IF NOT EXISTS catering_watch.post_aliases (
  project_key text REFERENCES catering_watch.projects, platform text, kind text, value text,
  canonical_id text NOT NULL, PRIMARY KEY(project_key,platform,kind,value)
 );
+
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname='catering_watch_app') THEN
+    GRANT SELECT, INSERT, UPDATE, DELETE ON catering_watch.dataset_pages,
+      catering_watch.tracked_accounts, catering_watch.post_aliases TO catering_watch_app;
+  END IF;
+END $$;

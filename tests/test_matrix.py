@@ -143,23 +143,30 @@ def test_wheel_contains_runnable_cli_and_catalog(tmp_path):
 
 
 def test_cache_hit_reuses_posts_without_actor(monkeypatch):
-    def unexpected_actor():
-        pytest.fail("cached query attempted to create a paid client")
+    from catering_watch.adapters import ChannelsAdapter, DouyinAdapter
+    from catering_watch.ingest import key_for
 
-    class CachedAdapter:
-        actor = "cached"
+    monkeypatch.setenv("APIFY_BUILD", "test-build")
+    adapter = ChannelsAdapter()
+    expected = key_for(adapter.actor, adapter.search_payload("侯宝贝", 1), "test-build")
 
-        def __new__(cls):
-            return unexpected_actor()
+    def cached(keys):
+        assert keys == [expected]
+        return {"result_count": 1, "metadata": {"post_db_ids": [17]}}
 
     row = dict(post("channels"), id=17, cover_url=None)
-    monkeypatch.setattr(cli, "ADAPTERS", {"douyin": CachedAdapter, "channels": CachedAdapter})
+    monkeypatch.setattr(cli, "ADAPTERS", {"douyin": DouyinAdapter, "channels": ChannelsAdapter})
+    monkeypatch.setattr(cli, "find_cached_fetch", cached)
     monkeypatch.setattr(
-        cli, "find_cached_fetch", lambda fp: {"result_count": 1, "metadata": {"post_db_ids": [17]}}
+        cli.tracking.Budget, "request", lambda *a: pytest.fail("unexpected Actor call")
     )
     monkeypatch.setattr(cli, "get_posts_by_ids", lambda ids: [row] if ids == [17] else [])
-    result = cli._cross_search("douyin", "侯宝贝", 1, 0.1)
+    monkeypatch.setattr(cli, "save_candidate_match", lambda *args: None)
+    result = cli._cross_search(
+        "douyin", "侯宝贝", 1, 0.1, dict(post("douyin", duration_seconds=90), db_post_id=3)
+    )
     assert result[0]["cache_hit"] and result[0]["post_id"] == row["platform_post_id"]
+    assert result[0]["match"]["relation"] == "not_matched_by_metadata"
 
 
 def test_search_observation_types():

@@ -4,21 +4,25 @@ import hashlib
 import json
 import os
 import time
-from uuid import uuid4
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from decimal import ROUND_DOWN, Decimal
+from urllib.parse import parse_qsl, unquote_plus, urlencode, urlsplit, urlunsplit
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
 
+from .apify import ApifyClient, ApifyError, StartRejected
 from .config import settings
 from .db import connect
-from .apify import ApifyClient, ApifyError
 
 ACTIVE = ("STARTING", "RUNNING", "RECONCILE")
 SUCCESS = ("SUCCEEDED", "SUCCEEDED_WITH_WARNINGS")
-PROJECT = settings.project_key
 PAGE = 100
+
+
+class InsufficientBudget(ApifyError):
+    pass
 
 
 def timestamp(value):
@@ -31,7 +35,9 @@ def timestamp(value):
     except (TypeError, ValueError, OverflowError, OSError):
         try:
             dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            return dt.timestamp() if dt.tzinfo else None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            return dt.timestamp()
         except (ValueError, OverflowError):
             return None
 
@@ -59,9 +65,29 @@ def clean(value):
         return [clean(v) for v in value]
     if isinstance(value, str) and value.startswith(("https://", "http://")):
         u = urlsplit(value)
-        keep = [(k, v) for k, v in parse_qsl(u.query) if k in {"modal_id", "id", "note_id"}]
+        public_ids = {"modal_id", "id", "note_id"}
+        if u.hostname in {"channels.weixin.qq.com", "finder.video.qq.com"}:
+            public_ids.update(("channelId", "finderUserName", "username"))
+        keep = [(k, v) for k, v in parse_qsl(u.query) if k in public_ids]
         return urlunsplit((u.scheme, u.hostname or "", u.path, urlencode(keep), ""))
     return value
+
+
+def cover_url(value):
+    if not isinstance(value, str) or not value.startswith(("https://", "http://")):
+        return None
+    u = urlsplit(value)
+    # Re-encoding a signature (even a space or a percent escape) can invalidate it.
+    parts = []
+    for part in u.query.split("&"):
+        key = unquote_plus(part.partition("=")[0]).casefold().replace("-", "_")
+        wechat_media_token = key == "token" and u.hostname == "wxapp.tc.qq.com"
+        if wechat_media_token or not any(
+            s in key
+            for s in ("token", "password", "secret", "cookie", "authorization", "api_key", "apikey")
+        ):
+            parts.append(part)
+    return urlunsplit((u.scheme, u.netloc.rsplit("@", 1)[-1], u.path, "&".join(parts), ""))
 
 
 REPLAY_FIELDS = set(
@@ -73,16 +99,37 @@ REPLAY_FIELDS = set(
  user_id sec_user_id nickname profile_url author_douyin_id author_red_id page_next_page_token page_has_more
  collection_run_id like_count digg_count comment_count share_count collect_count liked_count collected_count
  likes comments shares favorites topics hashtags is_top is_pinned is_ad verification_type
+ name bio desc channelName channelTitle introduction follower_count fans_count
+ verifiedEntity verification_label fansCount videoId createTime durationText page_item_count
 """.split()
 )
 
 
-def replay_fields(row):
-    result = {k: clean(v) for k, v in row.items() if k in REPLAY_FIELDS}
+def replay_fields(row, operation=None):
+    result = {
+        k: cover_url(v) if k in {"cover_image_url", "image"} else clean(v)
+        for k, v in row.items()
+        if k in REPLAY_FIELDS
+    }
     if isinstance(result.get("source"), dict):
         result["source"] = {
             k: v for k, v in result["source"].items() if k in {"title", "id", "username"}
         }
+    if (
+        operation == "channelSearch"
+        and not result.get("bio")
+        and isinstance(row.get("signature"), str)
+    ):
+        result["bio"] = clean(row["signature"])
+    media = row.get("media")
+    if isinstance(media, dict) and isinstance(media.get("coverUrl"), str):
+        cover = media["coverUrl"]
+        suffix = media.get("coverUrlToken")
+        if isinstance(suffix, str) and suffix.startswith("&token="):
+            cover += suffix if "?" in cover else "?" + suffix[1:]
+        result["image"] = result.get("image") or cover_url(cover)
+    if isinstance(media, dict) and media.get("videoPlayLen") is not None:
+        result["duration"] = result.get("duration") or media["videoPlayLen"]
     return result
 
 
@@ -93,27 +140,28 @@ def key_for(actor, payload, build):
 def claim(platform, actor, payload, build, cap, floor):
     fp = key_for(actor, payload, build)
     with connect() as db:
-        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (PROJECT,))
+        project = settings.project_key
+        db.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (project,))
         previous = db.execute(
             """SELECT * FROM catering_watch.fetch_runs WHERE project_key=%s
             AND input_fingerprint=%s AND (status=ANY(%s) OR
             (status=ANY(%s) AND finished_at>now()-%s*interval '1 hour'))
             ORDER BY id DESC LIMIT 1""",
-            (PROJECT, fp, list(ACTIVE), list(SUCCESS), settings.cache_ttl_hours),
+            (project, fp, list(ACTIVE), list(SUCCESS), settings.cache_ttl_hours),
         ).fetchone()
         if previous:
             return previous, False
         held = db.execute(
             """SELECT coalesce(sum(reserved_usd),0) AS amount FROM catering_watch.fetch_runs
-            WHERE project_key=%s AND (started_at >= (date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
+            WHERE project_key=%s AND (coalesce(finished_at, started_at) >= (date_trunc('day',now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC')
             OR status=ANY(%s))""",
-            (PROJECT, list(ACTIVE)),
+            (project, list(ACTIVE)),
         ).fetchone()["amount"]
         if not settings.apify_token or "<" in settings.apify_token:
             raise ApifyError("APIFY_TOKEN 未配置")
         limit = Decimal(os.getenv("DAILY_BUDGET_USD", str(settings.max_cost_usd)))
         if cap < floor or held + cap > limit:
-            raise ApifyError(
+            raise InsufficientBudget(
                 f"预算不足，已跳过 {platform}/{payload['operation']} (minimum {floor}, cap {cap})"
             )
         row = db.execute(
@@ -121,7 +169,7 @@ def claim(platform, actor, payload, build, cap, floor):
             status,idempotency_key,reserved_usd,metadata) VALUES(%s,%s,%s,%s,'STARTING',
             %s,%s,%s) RETURNING *""",
             (
-                PROJECT,
+                project,
                 platform,
                 payload["operation"],
                 fp,
@@ -131,6 +179,7 @@ def claim(platform, actor, payload, build, cap, floor):
                     {
                         "actor": actor,
                         "build": build,
+                        "request_cap_usd": str(cap),
                         "query": payload.get("keyword")
                         or next(iter(payload.get("keywords", [])), None),
                     }
@@ -148,14 +197,12 @@ class DurableClient:
     def run(self, actor, payload, max_cost_usd):
         build = os.getenv("APIFY_BUILD", "latest")
         cap = Decimal(str(max_cost_usd)).quantize(Decimal(".0001"), rounding=ROUND_DOWN)
-        price = Decimal(str(self.adapter.price_per_item))
-        if payload["operation"] == "channelSearch":
-            price = Decimal(".00899")
+        price = self.adapter.item_price(payload["operation"])
         start = Decimal(str(self.adapter.start_fee))
         row, new = claim(self.adapter.platform, actor, payload, build, cap, start + price)
         rid = row["id"]
         if not new and row["status"] in SUCCESS:
-            return self.result(rid)
+            return self.result(rid, new=False, cached=True)
         if not new and not row["provider_run_id"]:
             raise ApifyError(f"任务 {rid} 正在启动或待核对，请勿重新提交")
         client = self.transport
@@ -166,6 +213,14 @@ class DurableClient:
             try:
                 run = client.start(actor, payload, cap, build)
                 provider = run["id"]
+            except StartRejected as exc:
+                with connect() as db:
+                    db.execute(
+                        """UPDATE catering_watch.fetch_runs SET status='FAILED',reserved_usd=0,
+                        finished_at=now(),error_message=%s WHERE id=%s""",
+                        (str(exc), rid),
+                    )
+                raise
             except Exception:
                 with connect() as db:
                     db.execute(
@@ -188,7 +243,6 @@ class DurableClient:
             time.sleep(1)
             run = client.status(provider)
         ok = run["status"] in SUCCESS
-        live_rows = []
         while True:
             with connect() as db:
                 state = db.execute(
@@ -200,10 +254,13 @@ class DurableClient:
                 offset = state["result_count"]
                 rows = client.page(run["defaultDatasetId"], offset, PAGE) if ok else []
                 if rows:
-                    live_rows.extend(rows)
                     db.execute(
                         "INSERT INTO catering_watch.dataset_pages VALUES(%s,%s,%s)",
-                        (rid, offset, Jsonb([replay_fields(item) for item in rows])),
+                        (
+                            rid,
+                            offset,
+                            Jsonb([replay_fields(item, payload["operation"]) for item in rows]),
+                        ),
                     )
                     offset += len(rows)
                     db.execute(
@@ -212,12 +269,18 @@ class DurableClient:
                     )
                 if len(rows) == PAGE:
                     continue
-                amount = min(row["reserved_usd"], start + offset * price)
+                reported = run.get("usageTotalUsd")
+                estimated = reported is None
+                reserved = row["reserved_usd"]
+                amount = min(reserved, start + offset * price) if ok else reserved
+                if not estimated:
+                    amount = reserved = Decimal(str(reported))
                 db.execute(
-                    """UPDATE catering_watch.fetch_runs SET status=%s,finished_at=now(),
+                    """UPDATE catering_watch.fetch_runs SET status=%s,finished_at=now(),reserved_usd=%s,
                     metadata=metadata||%s WHERE id=%s""",
                     (
                         run["status"],
+                        reserved,
                         Jsonb(
                             {
                                 "actor_build_id": run.get("buildId"),
@@ -230,26 +293,38 @@ class DurableClient:
                 )
                 db.execute(
                     """INSERT INTO catering_watch.cost_ledger(project_key,fetch_run_id,provider,actor_name,
-                    operation,units,unit_price_usd,amount_usd,estimated) VALUES(%s,%s,'apify',%s,%s,%s,%s,%s,true)""",
-                    (PROJECT, rid, actor, payload["operation"], offset, price, amount),
+                    operation,units,unit_price_usd,amount_usd,estimated) VALUES(%s,%s,'apify',%s,%s,%s,%s,%s,%s)""",
+                    (
+                        settings.project_key,
+                        rid,
+                        actor,
+                        payload["operation"],
+                        offset,
+                        price,
+                        amount,
+                        estimated,
+                    ),
                 )
                 break
         if not ok:
             raise ApifyError(f"Actor {provider}: {run['status']}")
-        meta, stored = self.result(rid)
-        return meta, (live_rows if len(live_rows) == len(stored) else stored)
+        return self.result(rid, new=new, cached=False)
 
     @staticmethod
-    def result(rid):
+    def result(rid, *, new, cached):
         with connect() as db:
             row = db.execute(
-                "SELECT provider_run_id,status,metadata FROM catering_watch.fetch_runs WHERE id=%s",
+                "SELECT provider_run_id,status,reserved_usd FROM catering_watch.fetch_runs WHERE id=%s",
                 (rid,),
             ).fetchone()
             pages = db.execute(
                 "SELECT items FROM catering_watch.dataset_pages WHERE fetch_id=%s ORDER BY page_offset",
                 (rid,),
             )
-            return {"id": row["provider_run_id"], "status": row["status"], "fetch_id": rid}, [
-                item for page in pages for item in page["items"]
-            ]
+            return {
+                "id": row["provider_run_id"],
+                "status": row["status"],
+                "fetch_id": rid,
+                "command_cost_usd": row["reserved_usd"] if new else Decimal(0),
+                "cached": cached,
+            }, [item for page in pages for item in page["items"]]

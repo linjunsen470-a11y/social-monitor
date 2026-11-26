@@ -26,3 +26,26 @@ def test_xhs_normalize():
 def test_platform_detection():
     assert detect_platform("https://www.douyin.com/video/123456789012") == "douyin"
     assert detect_platform("https://www.xiaohongshu.com/explore/abc") == "xiaohongshu"
+
+
+def test_track_profile_uses_account_path_segment(monkeypatch):
+    from typer.testing import CliRunner
+    from catering_watch import cli
+
+    seen = []
+    monkeypatch.setattr(
+        cli.tracking, "register", lambda brand, platform, uid, evidence: seen.append(uid)
+    )
+    for platform, url in [
+        ("douyin", "https://www.douyin.com/user/stable/video"),
+        ("xiaohongshu", "https://www.xiaohongshu.com/user/profile/stable/notes"),
+        (
+            "channels",
+            "https://channels.weixin.qq.com/profile?channelId=stable&finderUserName=alias",
+        ),
+    ]:
+        result = CliRunner().invoke(
+            cli.app, ["track-account", "品牌", platform, url, "--kind", "url", "--execute"]
+        )
+        assert result.exit_code == 0, result.exception
+    assert seen == ["stable"] * 3
