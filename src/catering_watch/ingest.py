@@ -66,6 +66,11 @@ def clean(value):
         public_ids = {"modal_id", "id", "note_id"}
         if u.hostname in {"channels.weixin.qq.com", "finder.video.qq.com"}:
             public_ids.update(("channelId", "finderUserName", "username"))
+        if (
+            u.hostname == "channels.weixin.qq.com"
+            and u.path.rstrip("/") == "/finder-preview/pages/feed"
+        ):
+            public_ids.add("eid")
         keep = [(k, v) for k, v in parse_qsl(u.query) if k in public_ids]
         return urlunsplit((u.scheme, u.hostname or "", u.path, urlencode(keep), ""))
     return value
@@ -93,7 +98,7 @@ REPLAY_FIELDS = set(
  aweme_id description publish_time video_duration_ms cover_image_url share_url author_name author_sec_user_id
  author_user_id author_profile_url verification_text author_custom_verify author_enterprise_verify_reason
  enterprise_verify_reason docID hashDocID exportId channelId finderUserName username creatorName source
- title image url creatorUrl publishedAt pubTime duration note_id note_url note_type type summary content
+ title image url shareUrl creatorUrl publishedAt pubTime duration note_id note_url note_type type summary content
  user_id sec_user_id nickname profile_url author_douyin_id author_red_id page_next_page_token page_has_more
  collection_run_id like_count digg_count comment_count share_count collect_count liked_count collected_count
  likes comments shares favorites topics hashtags is_top is_pinned is_ad verification_type
@@ -178,6 +183,7 @@ def claim(platform, actor, payload, build, cap, floor):
                         "build": build,
                         "request_cap_usd": str(cap),
                         "query": payload.get("keyword")
+                        or payload.get("query")
                         or next(iter(payload.get("keywords", [])), None),
                     }
                 ),
@@ -199,6 +205,13 @@ class DurableClient:
         row, new = claim(self.adapter.platform, actor, payload, build, cap, start + price)
         rid = row["id"]
         if not new and row["status"] == "SUCCEEDED":
+            if (
+                payload["operation"] == "public_post_search"
+                and hasattr(self.adapter, "prepare_row")
+                and row["result_count"]
+                and not row["metadata"].get("mapped_search_rows")
+            ):
+                self.refresh_search_cache(row)
             return self.result(rid, new=False, cached=True)
         if not new and not row["provider_run_id"]:
             raise ApifyError(f"任务 {rid} 正在启动或待核对，请勿重新提交")
@@ -208,7 +221,10 @@ class DurableClient:
             client = ApifyClient()
         if new:
             try:
-                run = client.start(actor, payload, cap, build)
+                actor_input = getattr(self.adapter, "actor_input", None)
+                run = client.start(
+                    actor, actor_input(payload) if actor_input else payload, cap, build
+                )
                 provider = run["id"]
             except StartRejected as exc:
                 with connect() as db:
@@ -251,12 +267,20 @@ class DurableClient:
                 offset = state["result_count"]
                 rows = client.page(run["defaultDatasetId"], offset, PAGE) if ok else []
                 if rows:
+                    prepare = getattr(self.adapter, "prepare_row", None)
                     db.execute(
                         "INSERT INTO catering_watch.dataset_pages VALUES(%s,%s,%s)",
                         (
                             rid,
                             offset,
-                            Jsonb([replay_fields(item, payload["operation"]) for item in rows]),
+                            Jsonb(
+                                [
+                                    replay_fields(
+                                        prepare(item) if prepare else item, payload["operation"]
+                                    )
+                                    for item in rows
+                                ]
+                            ),
                         ),
                     )
                     offset += len(rows)
@@ -282,6 +306,8 @@ class DurableClient:
                             {
                                 "actor_build_id": run.get("buildId"),
                                 "dataset_id": run.get("defaultDatasetId"),
+                                "mapped_search_rows": payload["operation"] == "public_post_search"
+                                and hasattr(self.adapter, "prepare_row"),
                                 "usage_total_usd": run.get("usageTotalUsd"),
                             }
                         ),
@@ -306,6 +332,37 @@ class DurableClient:
         if not ok:
             raise ApifyError(f"Actor {provider}: {run['status']}")
         return self.result(rid, new=new, cached=False)
+
+    def refresh_search_cache(self, row):
+        """Re-project earlier public-search cache pages from the same paid Dataset."""
+        dataset = row["metadata"].get("dataset_id")
+        if not dataset:
+            raise ApifyError("旧缓存缺少 Dataset ID，请回放留存的原始响应")
+        client = self.transport or ApifyClient()
+        with connect() as db:
+            locked = db.execute(
+                "SELECT metadata FROM catering_watch.fetch_runs WHERE id=%s FOR UPDATE",
+                (row["id"],),
+            ).fetchone()
+            if locked["metadata"].get("mapped_search_rows"):
+                return
+            for offset in range(0, row["result_count"], PAGE):
+                size = min(PAGE, row["result_count"] - offset)
+                items = client.page(dataset, offset, size)
+                if len(items) != size:
+                    raise ApifyError("旧 Dataset 缺页，请使用留存响应回放")
+                mapped = [
+                    replay_fields(self.adapter.prepare_row(r), "public_post_search") for r in items
+                ]
+                db.execute(
+                    "UPDATE catering_watch.dataset_pages SET items=%s WHERE fetch_id=%s AND page_offset=%s",
+                    (Jsonb(mapped), row["id"], offset),
+                )
+            db.execute(
+                """UPDATE catering_watch.fetch_runs
+                          SET metadata=metadata || '{"mapped_search_rows":true}'::jsonb WHERE id=%s""",
+                (row["id"],),
+            )
 
     @staticmethod
     def result(rid, *, new, cached):

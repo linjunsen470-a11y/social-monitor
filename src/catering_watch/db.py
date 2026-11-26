@@ -239,7 +239,7 @@ def save_candidate_match(source_post_id, target_post_id, result, source_url, tar
 
 
 POST_SELECT = """
-    SELECT p.*, a.current_name AS author_name, a.platform_account_id AS author_id,
+    SELECT p.*, coalesce(a.current_name,p.metadata->>'publisher') AS author_name, a.platform_account_id AS author_id,
            a.profile_url AS author_url, a.verification_text, f.cover_phash
     FROM catering_watch.posts p
     LEFT JOIN catering_watch.accounts a ON a.id=p.account_id AND a.project_key=p.project_key

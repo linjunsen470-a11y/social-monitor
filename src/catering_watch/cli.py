@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+from uuid import UUID
 
 import typer
 from rich import print
@@ -31,7 +32,9 @@ from .matching import cover_feature
 from .matrix import CATALOG, REPORT_FIELDS, read_report, search_terms, seed_brand
 
 app = typer.Typer(
-    no_args_is_help=True, help="Agent-first three-platform competitor content research"
+    no_args_is_help=True,
+    pretty_exceptions_show_locals=False,
+    help="Agent-first three-platform competitor content research",
 )
 
 
@@ -49,7 +52,7 @@ def _budget_check(max_cost, execute):
     return True
 
 
-def _persist(item, video_search=False):
+def _persist(item, video_search=False, *, fetch_cover=True):
     raw = item.raw
     declared = str(raw.get("note_type") or raw.get("type") or "").lower()
     media_type = "unknown"
@@ -91,7 +94,8 @@ def _persist(item, video_search=False):
         }
     )
 
-    _ensure_cover(post_id, image_url, get_cover_phash(post_id), item.platform)
+    if fetch_cover:
+        _ensure_cover(post_id, image_url, get_cover_phash(post_id), item.platform)
     return post_id
 
 
@@ -139,6 +143,8 @@ def _cross_search(source_platform, query, max_items, max_cost):
     budget = tracking.Budget(max_cost, execute=True)
     build = os.getenv("APIFY_BUILD", "latest")
     output = []
+    failures = []
+    successes = 0
     for target in (p for p in ADAPTERS if p != source_platform):
         try:
             adapter = ADAPTERS[target]()
@@ -152,9 +158,12 @@ def _cross_search(source_platform, query, max_items, max_cost):
             else:
                 run, raw = budget.request(target, payload, max_items)
                 if not run:
-                    print(f"{target} 预算不足，跳过检索")
+                    failures.append(f"{target} 预算不足，跳过检索")
                     continue
                 items = [item for row in raw if (item := adapter.normalize(row))]
+                if raw and not items:
+                    failures.append(f"{target} 返回的数据缺少可识别的作品 ID")
+                    continue
                 ids = []
                 for item in items:
                     item.raw["collection_run_id"] = run["id"]
@@ -192,8 +201,18 @@ def _cross_search(source_platform, query, max_items, max_cost):
                         "cache_hit": cache_hit,
                     }
                 )
+            successes += 1
         except Exception as exc:
-            print(f"[red]{target} failed[/red]: {exc}")
+            failures.append(f"{target} 检索失败 ({type(exc).__name__})")
+    if failures:
+        if successes:
+            _export(output)
+        for failure in failures:
+            typer.echo(failure, err=True)
+        typer.echo(
+            "部分平台完成，已导出可用结果。" if successes else "所有目标平台均未完成。", err=True
+        )
+        raise typer.Exit(1)
     return output
 
 
@@ -216,6 +235,13 @@ def doctor(check_apify: bool = typer.Option(False, "--check-apify")):
         print({"neon": dict(db_status())})
     if check_apify:
         print({"apify": ApifyClient().check_auth()})
+    if (
+        not settings.database_url
+        or "<" in settings.database_url
+        or not settings.apify_token
+        or "<" in settings.apify_token
+    ):
+        raise typer.Exit(1)
 
 
 @app.command("init-db")
@@ -246,6 +272,7 @@ def scan(
             {"source": platform, "targets": [p for p in ADAPTERS if p != platform], "query": query}
         )
         return
+    db_status()
     rows = _cross_search(platform, query, max_items or settings.max_items_per_search, max_cost)
     _export(rows)
     print(f"Exported {len(rows)} candidate rows.")
@@ -282,6 +309,9 @@ def scan_url(
         sources = [existing]
     else:
         run, raw = budget.request(source, payload, limit)
+        if execute and not run:
+            typer.echo("预算不足，未完成源入口查询。", err=True)
+            raise typer.Exit(1)
         items = [item for row in raw if (item := adapter.normalize(row))]
         if not (profile and source == "channels"):
             items = items[:limit]
@@ -539,6 +569,69 @@ def write_report(kind, format, output, rows):
     else:
         raise typer.BadParameter("format must be csv or jsonl")
     print(f"Exported {len(rows)} {kind} rows to {output}")
+
+
+@app.command("research")
+def research_command(
+    query: list[str] = typer.Option(..., "--query", help="微信作品搜索词，可重复"),
+    max_items: int = typer.Option(12, min=1),
+    peer_items: int = typer.Option(3, min=1),
+    max_details: int = typer.Option(2, min=0),
+    review: Path | None = typer.Option(None, exists=True, readable=True),
+    replay: Path | None = typer.Option(None, exists=True, readable=True),
+    output: Path = Path("outputs/research.xlsx"),
+    execute: bool = False,
+    max_cost: float | None = None,
+):
+    """从微信关键词发现作品，再以品牌或发布者为线索检索其他两端。"""
+    from .research import Research, export_report, save_report, validate_review
+
+    query = list(dict.fromkeys(q.strip() for q in query))
+    if not all(query):
+        raise typer.BadParameter("关键词不能为空")
+
+    if not execute:
+        print(
+            {
+                "微信关键词": query,
+                "每词上限": max_items,
+                "每品牌每端上限": peer_items,
+                "补查详情上限": max_details,
+                "预算": max_cost,
+                "回放": bool(replay),
+            }
+        )
+        return
+    if not replay:
+        _budget_check(max_cost, True)
+    db_status()
+    with connect() as db:
+        db.execute("SELECT id FROM catering_watch.research_reports LIMIT 0")
+    archive = json.loads(replay.read_text(encoding="utf-8")) if replay else None
+    if replay and not isinstance(archive, list):
+        raise typer.BadParameter("回放文件必须为 JSON 数组")
+    notes = json.loads(review.read_text(encoding="utf-8")) if review else {}
+    validate_review(notes)
+    worker = Research(
+        tracking.Budget(max_cost, True), lambda item: _persist(item, fetch_cover=False), archive
+    )
+    result = worker.collect(query, max_items, max_details, peer_items, notes)
+    rid = save_report(result)
+    typer.echo(f"调研 ID {rid}")
+    export_report(rid, output)
+    typer.echo(f"已导出 {len(result['videos'])} 条微信作品至 {output}")
+    if not result["complete"]:
+        typer.echo("部分检索未完成，原因见检索记录。", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("research-report")
+def research_report(report_id: UUID, output: Path = Path("outputs/research.xlsx")):
+    """按调研 ID 从 Neon 重新导出 Excel，无需调用 Apify。"""
+    from .research import export_report
+
+    export_report(report_id, output)
+    typer.echo(f"已导出至 {output}")
 
 
 if __name__ == "__main__":
