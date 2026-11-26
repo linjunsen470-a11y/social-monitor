@@ -1,13 +1,12 @@
 """Evidence-based video coverage and direct source-to-target repost reports."""
 
 import json
-import re
 import os
 from pathlib import Path
 
-from rapidfuzz.fuzz import ratio
+from .tracking import catalog_for
 
-from .matching import normalize_text
+from .matching import compare_posts
 
 PLATFORMS = ("douyin", "channels", "xiaohongshu")
 CATALOG = json.loads(
@@ -24,6 +23,7 @@ REPORT_FIELDS = {
         "source_platform",
         "source",
         *PLATFORMS,
+        "review_candidates",
         "suspected_platform_count",
         "conclusion",
         "window_start",
@@ -31,9 +31,6 @@ REPORT_FIELDS = {
     ]
 }
 FIRST_RUN = "https://github.com/linjunsen470-a11y/social-monitor/blob/main/FIRST_RUN_RESULTS.md"
-GENERIC = re.compile(
-    r"有限公司|餐饮管理|团餐配送|团餐|食堂承包|广州|广东|员工餐|餐饮|配送|工作餐|企业|食堂|美食|后厨|厨房|现场|每天|新鲜|现炒|菜品|定制|\s+"
-)
 
 
 def search_terms(brand):
@@ -59,7 +56,10 @@ def ownership(brand, post):
     if post["verification_text"] and post["verification_text"] in brand.get("entities", []):
         return post["verification_text"]
     for account in brand.get("accounts", []):
-        if (account["platform"], account["id"]) == (post["platform"], post["author_id"]):
+        if account.get("evidence_url") and (account["platform"], account["id"]) == (
+            post["platform"],
+            post["author_id"],
+        ):
             return account["evidence_url"]
     return None
 
@@ -73,43 +73,14 @@ def relates(brand, post):
     )
     text = " ".join(str(f) for f in fields if f).casefold()
     return (
-        ownership(brand, post)
+        any(
+            a["platform"] == post["platform"] and a["id"] == post["author_id"]
+            for a in brand.get("accounts", [])
+        )
+        or ownership(brand, post)
         or post["platform_post_id"] in brand.get("seeds", {}).get(post["platform"], [])
         or any(term.casefold() in text for term in search_terms(brand))
     )
-
-
-def distinctive(value, brand):
-    text = normalize_text(value)
-    for term in sorted(search_terms(brand), key=len, reverse=True):
-        text = text.replace(normalize_text(term), "")
-    return GENERIC.sub("", text)
-
-
-def repost_reasons(source, target, brand):
-    hashes = [p["cover_phash"] for p in (source, target)]
-    if not all(re.fullmatch(r"[0-9a-fA-F]{16}", h or "") for h in hashes):
-        return []
-    distance = (int(hashes[0], 16) ^ int(hashes[1], 16)).bit_count()
-    if distance > 8:
-        return []
-    a, b = [p["duration_seconds"] for p in (source, target)]
-    if a and b and abs(float(a) - float(b)) > max(2, 0.05 * min(float(a), float(b))):
-        return []
-    left, right = (
-        [distinctive(p[k], brand) for k in ("title", "body_text")] for p in (source, target)
-    )
-    if not any(min(len(x), len(y)) >= 8 and ratio(x, y) >= 88 for x in left for y in right):
-        return []
-    reasons = [
-        f"封面指纹距离 {distance}/64",
-        "独特文案高度相似",
-        "时长接近" if a and b else "时长缺失",
-    ]
-    if source["published_at"] and target["published_at"]:
-        gap = (target["published_at"] - source["published_at"]).total_seconds() / 3600
-        reasons.append(f"目标作品发布时间相对源作品 {gap:+.1f} 小时")
-    return reasons
 
 
 def evidence(p, owner):
@@ -121,11 +92,13 @@ def evidence(p, owner):
         "title": p["title"],
         "account_id": p["author_id"],
         "operator_evidence": owner,
+        "cover_status": p["metadata"].get("cover_status"),
+        "run_id": p["metadata"].get("raw_payload", {}).get("collection_run_id"),
         "video": video_status(p),
     }
 
 
-def reports(kind, posts, runs, catalog=CATALOG):
+def reports(kind, posts, runs, catalog=CATALOG, on_match=None):
     rows = []
     for brand in catalog:
         related = [p for p in posts if video_status(p) is not False and relates(brand, p)]
@@ -140,16 +113,32 @@ def reports(kind, posts, runs, catalog=CATALOG):
                     "source_platform": source["platform"],
                     "source": evidence(source, owner),
                 }
+                row["review_candidates"] = []
                 count = 0
                 for platform, candidates in by_platform.items():
                     matches = []
-                    if owner and platform != source["platform"]:
+                    if platform != source["platform"]:
                         for p in candidates:
                             target_owner = ownership(brand, p)
-                            if not target_owner or video_status(p) is not True:
+                            if video_status(p) is not True:
                                 continue
-                            reasons = repost_reasons(source, p, brand)
-                            if reasons:
+                            result = compare_posts(source, p, brand)
+                            if on_match:
+                                on_match(source, p, result)
+                            reasons = result["reasons"]
+                            if result["relation"] != "not_matched_by_metadata" and not (
+                                owner
+                                and target_owner
+                                and result["relation"] == "high_similarity_candidate"
+                            ):
+                                row["review_candidates"].append(
+                                    dict(
+                                        evidence(p, target_owner),
+                                        platform=platform,
+                                        reasons=reasons,
+                                    )
+                                )
+                            elif result["relation"] == "high_similarity_candidate":
                                 matches.append(dict(evidence(p, target_owner), reasons=reasons))
                     row[platform] = matches
                     count += bool(matches)
@@ -217,10 +206,11 @@ def historical_checks(start, end):
     ]
 
 
-def read_report(kind):
+def read_report(kind, on_match=None):
     from .db import POST_SELECT, connect, settings
 
     with connect() as conn:
+        catalog = catalog_for(conn, CATALOG)
         window = conn.execute(
             "SELECT now() AS finish, now()-interval '6 months' AS start"
         ).fetchone()
@@ -245,22 +235,22 @@ def read_report(kind):
         ).fetchall()
         runs = conn.execute(
             """SELECT platform,status,finished_at,metadata FROM catering_watch.fetch_runs
-            WHERE project_key=%s AND operation='keyword_search' AND finished_at BETWEEN %s AND %s
+            WHERE project_key=%s AND operation IN ('keyword_search','channelSearch','search_users','videoSearch','search_videos','search_notes') AND finished_at BETWEEN %s AND %s
             ORDER BY finished_at""",
             (settings.project_key, window["start"], window["finish"]),
         ).fetchall()
-    return assemble_report(kind, posts, runs, window, settings.project_key)
+    return assemble_report(kind, posts, runs, window, settings.project_key, catalog, on_match)
 
 
-def assemble_report(kind, posts, runs, window, project_key):
+def assemble_report(kind, posts, runs, window, project_key, catalog=CATALOG, on_match=None):
     start, end = window["start"], window["finish"]
     history = (
         historical_checks(start, end) if project_key == "guangzhou_catering_competitors" else []
     )
     recent = [p for p in posts if p["published_at"] and start <= p["published_at"] <= end]
-    rows = reports(kind, recent, history + runs)
+    rows = reports(kind, recent, history + runs, catalog, on_match)
     if kind == "coverage":
-        for brand, row in zip(CATALOG, rows):
+        for brand, row in zip(catalog, rows):
             for post in posts:
                 platform = post["platform"]
                 if (

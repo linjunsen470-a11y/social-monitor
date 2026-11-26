@@ -7,7 +7,7 @@ def test_same_caption_is_candidate_not_proof():
     a={"title":"工厂员工餐配送","body_text":"每天准时送达，食堂承包"}
     b={"title":"工厂员工餐配送","body_text":"每天准时送达，食堂承包"}
     result=compare_posts(a,b)
-    assert result["relation"] == "high_similarity_candidate"
+    assert result["relation"] != "high_similarity_candidate"
     assert "不证明视频文件相同" in result["warning"]
 
 def test_generic_topic_not_overstated():

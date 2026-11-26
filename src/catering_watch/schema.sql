@@ -85,3 +85,21 @@ CREATE INDEX IF NOT EXISTS idx_fetch_runs_idempotency ON catering_watch.fetch_ru
 INSERT INTO catering_watch.projects(project_key, display_name)
 VALUES ('guangzhou_catering_competitors','广州及周边团餐配送竞品监测')
 ON CONFLICT (project_key) DO NOTHING;
+
+-- Additive migration. Existing fetches keep NULL reservation and provider id.
+ALTER TABLE catering_watch.fetch_runs ADD COLUMN IF NOT EXISTS reserved_usd numeric;
+ALTER TABLE catering_watch.fetch_runs ADD COLUMN IF NOT EXISTS provider_run_id text;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_run ON catering_watch.fetch_runs(project_key,provider_run_id);
+CREATE TABLE IF NOT EXISTS catering_watch.dataset_pages (
+  fetch_id bigint REFERENCES catering_watch.fetch_runs(id), page_offset integer,
+  items jsonb NOT NULL, PRIMARY KEY(fetch_id,page_offset)
+);
+CREATE TABLE IF NOT EXISTS catering_watch.tracked_accounts (
+  project_key text REFERENCES catering_watch.projects, brand text, platform text, stable_id text,
+  evidence_url text, synced_at timestamptz, PRIMARY KEY(project_key,brand,platform,stable_id)
+);
+ALTER TABLE catering_watch.tracked_accounts ADD COLUMN IF NOT EXISTS next_cursor text;
+CREATE TABLE IF NOT EXISTS catering_watch.post_aliases (
+ project_key text REFERENCES catering_watch.projects, platform text, kind text, value text,
+ canonical_id text NOT NULL, PRIMARY KEY(project_key,platform,kind,value)
+);

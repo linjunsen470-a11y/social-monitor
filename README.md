@@ -71,3 +71,24 @@ competitor-watch report --kind reposts --format jsonl --output outputs/reposts.j
 ## 版本库约定
 
 提交源码、测试、种子样例和开发说明。实际连接信息放在本地 `.env` 或运行环境的 Secrets 中。报告写到 `outputs/`，构建产物、缓存、压缩包和本地配置由 Git 忽略。
+
+## 账号级追踪与恢复
+
+升级前先用迁移角色在目标库执行一次 `competitor-watch init-db`。迁移给现有 fetch_runs 增加预留金额和外部 run ID，并创建分页、别名和账号追踪表。运行角色需要该 schema 下业务表的读写权及序列使用权。部署顺序为先迁移、再更新 CLI；历史作品和已有报告仍可读取。
+
+```bash
+# 新账号无需修改内置目录。昵称检索返回候选，选择其稳定 ID 后再登记。
+competitor-watch track-account "品牌名" douyin "账号昵称" --kind name
+competitor-watch track-account "品牌名" douyin "稳定账号ID" --execute
+competitor-watch discover-peers "品牌名" douyin --max-cost 0.30
+competitor-watch sync-account "品牌名" douyin "稳定账号ID" --max-items 20 --max-cost 0.20
+competitor-watch match-local --output outputs/local-matches.jsonl
+```
+
+上述两个采集命令默认展示操作和额度。确认预算后加 `--execute`。登记自营关系时可提供 `--evidence-url` 指向公开证明；缺少证据的账号进入候选。抖音和小红书支持主页分享短链，视频号可用稳定 ID。抖音、小红书在返回分页游标时保存进度；视频号重访最新页。每次同步有作品数量上限，历史覆盖取决于平台公开返回的分页。重发报告的 `review_candidates` 单列值得复核的配对，自营计数仍要求两端归属及内容证据同时满足。
+
+`--max-cost` 限制单次命令。所有沙箱应使用相同的项目配置和 `DAILY_BUDGET_USD`，默认值为 `MAX_COST_USD`。项目按 UTC 自然日保守扣减每个新 run 的**请求上限**，跨日的未决任务继续占用额度。账本另存按事件价格估算的费用，最终结算以账单为准。可设置 `APIFY_BUILD` 选择三个 Actor 均支持的构建标签；默认 latest，共享成功缓存受 TTL 限制。
+
+同一参数再次运行会读取已完成的 Dataset 页，或继续轮询已登记的 run。STARTING 或 RECONCILE 且缺少 provider_run_id 时，先在 Apify Console 核对同一账号、Actor、启动时间和输入。确认唯一对应后，运维可将该行的 provider_run_id 填入并将 status 更新为 RUNNING，然后重试原命令；无法确认时保持待核对。新版本生效前启动的 Actor 仍需人工核账。
+
+集成测试使用独立临时 PostgreSQL。将 `CATERING_TEST_DATABASE_URL` 设置为测试库的本地 Unix socket 连接串（形如 `postgresql:///postgres?host=/tmp/测试目录`）再运行 pytest。测试会建表和写入独立的测试项目，Apify 使用模拟响应。
