@@ -4,7 +4,7 @@ import re
 
 import httpx
 
-from .config import settings
+from .config import credential, settings
 
 
 class ApifyError(RuntimeError):
@@ -25,13 +25,19 @@ class ApifyClient:
     base = "https://api.apify.com/v2"
 
     def __init__(self, token: str | None = None):
-        self.token = token if token is not None else settings.apify_token
-        if not self.token or "<YOUR_TOKEN>" in self.token:
+        self.token = credential(token) if token is not None else settings.apify_token
+        if not self.token:
             raise ApifyError("APIFY_TOKEN 未配置；请在 .env 中填写 Apify API token")
         self.client = httpx.Client(
             timeout=settings.http_timeout_seconds,
             headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
         )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.client.close()
 
     def check_auth(self) -> dict:
         response = self.client.get(f"{self.base}/users/me")
@@ -63,7 +69,8 @@ class ApifyClient:
 
     def status(self, provider):
         response = self.client.get(f"{self.base}/actor-runs/{provider}")
-        response.raise_for_status()
+        if not response.is_success:
+            raise ApifyError(f"Actor status: HTTP {response.status_code}")
         return response.json()["data"]
 
     def page(self, dataset, offset, limit):

@@ -1,4 +1,12 @@
-from catering_watch.matching import normalize_text, compare_posts
+import socket
+from io import BytesIO
+
+import httpx
+import pytest
+from PIL import Image
+
+from catering_watch.matching import compare_posts, cover_feature, normalize_text
+
 
 def test_normalize_chinese_text():
     assert normalize_text("员工餐配送！#广州团餐 https://x.test/a") == "员工餐配送"
@@ -32,3 +40,38 @@ def test_rewritten_title_and_near_cover_only_enter_review_with_compatible_durati
         compare_posts(a, dict(b, title=a["title"], duration_seconds=50))["relation"]
         == "not_matched_by_metadata"
     )
+
+
+@pytest.mark.parametrize("public_target", [True, False])
+def test_cover_validates_each_destination_and_preserves_tls_host(monkeypatch, public_target):
+    resolved = []
+    requested = []
+    png = BytesIO()
+    Image.new("RGB", (8, 8)).save(png, format="PNG")
+
+    def resolve(host, port, **kwargs):
+        resolved.append(host)
+        ip = "1.1.1.1" if host == "first.test" or public_target else "192.0.2.1"
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+    def respond(request):
+        host = request.headers["Host"]
+        requested.append(host)
+        assert request.url.host == "1.1.1.1"
+        assert request.extensions["sni_hostname"] == host
+        if host == "first.test":
+            return httpx.Response(302, headers={"Location": "https://cover.test/p?sig=A%2Fb"})
+        assert request.url.query == b"sig=A%2Fb"
+        return httpx.Response(200, content=png.getvalue())
+
+    original = httpx.Client
+    monkeypatch.setattr(socket, "getaddrinfo", resolve)
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kw: original(transport=httpx.MockTransport(respond), **kw)
+    )
+    phash, status = cover_feature("https://first.test/image")
+    assert resolved == ["first.test", "cover.test"]
+    if public_target:
+        assert status == "ok" and len(phash) == 16 and requested == resolved
+    else:
+        assert (phash, status) == (None, "blocked_url") and requested == ["first.test"]

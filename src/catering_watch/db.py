@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
 import psycopg
@@ -11,11 +12,7 @@ SCHEMA_SQL = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
 
 
 def connect():
-    if (
-        not settings.database_url
-        or "<PASSWORD>" in settings.database_url
-        or "<NEON_HOST>" in settings.database_url
-    ):
+    if not settings.database_url:
         raise RuntimeError("DATABASE_URL 未配置。请使用 Neon catering_watch_app 角色连接串。")
     return psycopg.connect(settings.database_url, row_factory=dict_row, connect_timeout=10)
 
@@ -38,19 +35,19 @@ def db_status():
 
 
 def upsert_account(
-    platform, account_id, name=None, url=None, verification=None, bio=None, source_metadata=None
+    platform,
+    account_id,
+    name=None,
+    url=None,
+    verification=None,
+    bio=None,
+    source_metadata=None,
+    *,
+    connection=None,
 ):
-    with connect() as conn:
-        if platform == "channels" and not (source_metadata or {}).get("channelId"):
-            # Feed rows often contain only username. Reuse the account identified by search.
-            known = conn.execute(
-                """SELECT platform_account_id FROM catering_watch.accounts WHERE project_key=%s
-                AND platform='channels' AND platform_account_id=source_metadata->>'channelId'
-                AND %s IN (source_metadata->>'finderUserName', source_metadata->>'username') LIMIT 2""",
-                (settings.project_key, str(account_id)),
-            ).fetchall()
-            if len(known) == 1:
-                account_id = known[0]["platform_account_id"]
+    with nullcontext(connection) if connection is not None else connect() as conn:
+        if platform == "channels":
+            account_id = channels_account_id(conn, str(account_id), source_metadata or {})
         row = conn.execute(
             """INSERT INTO catering_watch.accounts
           (project_key,platform,platform_account_id,current_name,profile_url,verification_text,bio,source_metadata)
@@ -67,9 +64,9 @@ def upsert_account(
                 platform,
                 str(account_id),
                 name,
-                url,
-                verification,
-                bio,
+                url or None,
+                verification or None,
+                bio or None,
                 Jsonb(source_metadata or {}),
             ),
         ).fetchone()
@@ -82,23 +79,61 @@ def upsert_account(
         return int(row["id"])
 
 
+def channels_account_id(conn, account_id, identifiers):
+    project = settings.project_key
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s,0))", (project + ":channels-account",)
+    )
+    channel = identifiers.get("channelId")
+    if not channel:
+        known = conn.execute(
+            """SELECT platform_account_id FROM catering_watch.accounts WHERE project_key=%s
+            AND platform='channels' AND platform_account_id=source_metadata->>'channelId'
+            AND %s IN (source_metadata->>'finderUserName', source_metadata->>'username') LIMIT 2""",
+            (project, account_id),
+        ).fetchall()
+        return known[0]["platform_account_id"] if len(known) == 1 else account_id
+
+    # Promote a single username-only account in place, preserving its post and alias FKs.
+    # Distinct existing canonical accounts require review.
+    aliases = [identifiers[k] for k in ("username", "finderUserName") if identifiers.get(k)]
+    if aliases:
+        known = conn.execute(
+            """SELECT id, platform_account_id, source_metadata FROM catering_watch.accounts
+            WHERE project_key=%s AND platform='channels' AND (platform_account_id=ANY(%s)
+            OR source_metadata->>'username'=ANY(%s) OR source_metadata->>'finderUserName'=ANY(%s))""",
+            (project, [channel, *aliases], aliases, aliases),
+        ).fetchall()
+        if (
+            len(known) == 1
+            and known[0]["platform_account_id"] in aliases
+            and not known[0]["source_metadata"].get("channelId")
+        ):
+            conn.execute(
+                "UPDATE catering_watch.accounts SET platform_account_id=%s WHERE id=%s",
+                (channel, known[0]["id"]),
+            )
+    return channel
+
+
 def channels_post_aliases(raw):
     return {k: str(raw[k]) for k in ("docID", "videoId", "hashDocID", "exportId") if raw.get(k)}
 
 
 def upsert_post(post: dict) -> int:
-    account_id = post.get("account_id")
-    if not account_id and post.get("author_id"):
-        account_id = upsert_account(
-            post["platform"],
-            post["author_id"],
-            post.get("author_name"),
-            post.get("author_url"),
-            post.get("verification"),
-            post.get("bio"),
-            post.get("author_identifiers"),
-        )
     with connect() as conn:
+        account_id = post.get("account_id")
+        if not account_id and post.get("author_id"):
+            account_id = upsert_account(
+                post["platform"],
+                post["author_id"],
+                post.get("author_name"),
+                post.get("author_url"),
+                post.get("verification"),
+                post.get("bio"),
+                post.get("author_identifiers"),
+                connection=conn,
+            )
         if post["platform"] == "channels":
             raw = post.get("metadata", {}).get("raw_payload", {})
             aliases = channels_post_aliases(raw)
@@ -137,11 +172,11 @@ def upsert_post(post: dict) -> int:
                 account_id,
                 post["platform"],
                 post["post_id"],
-                post.get("url"),
+                post.get("url") or None,
                 post.get("published_at"),
                 post.get("title"),
                 post.get("body"),
-                post.get("cover_url"),
+                post.get("cover_url") or None,
                 post.get("duration_seconds"),
                 post.get("content_hash"),
                 json.dumps(post.get("metadata", {}), ensure_ascii=False),
@@ -251,6 +286,10 @@ def get_posts_by_ids(ids):
         ).fetchall()
 
 
+class PostAliasConflict(ValueError):
+    pass
+
+
 def channels_post_id(conn, aliases, default):
     known = conn.execute(
         """SELECT DISTINCT canonical_id FROM catering_watch.post_aliases
@@ -259,7 +298,7 @@ def channels_post_id(conn, aliases, default):
         (settings.project_key, Jsonb(aliases)),
     ).fetchall()
     if len(known) > 1:
-        raise ValueError("视频号 ID 别名冲突，需核对")
+        raise PostAliasConflict("视频号 ID 别名冲突，需核对")
     return known[0]["canonical_id"] if known else default
 
 
@@ -273,10 +312,15 @@ def stored_post(platform, post_id, raw=None):
         ).fetchone()
 
 
-def save_cover_phash(post_id, value):
-    if not value:
-        return
+def save_cover_result(post_id, value, status):
     with connect() as conn:
+        conn.execute(
+            """UPDATE catering_watch.posts SET metadata=metadata || jsonb_build_object('cover_status',%s::text)
+            WHERE project_key=%s AND id=%s AND metadata->>'cover_status' IS DISTINCT FROM 'ok'""",
+            (status, settings.project_key, post_id),
+        )
+        if not value:
+            return
         conn.execute(
             """INSERT INTO catering_watch.post_features
             (project_key, post_id, feature_version, cover_phash)

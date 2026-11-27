@@ -67,7 +67,7 @@ Excel 包含竞品三端核查、微信视频作品、跨平台作品证据、�
 competitor-watch research --query "广州食堂承包" --replay data/replays/runs.json --max-details 0 --execute
 ```
 
-可选的 `--review data/replays/review.json` 可与在线检索或回放合用。其中 `selection` 将选中的微信 exportId 映射到品牌名，省略时使用各作品发布者作为线索。`terms` 指定各品牌在目标平台的实际搜索词，`video_links` 保存人工核对过的作品链接，`reviews` 保存归属核对结论及公开依据。未提供人工结论的线索会标记为待核实。
+可选的 `--review data/replays/review.json` 可与在线检索或回放合用。其中 `selection` 将选中的微信 exportId 映射到品牌名，至少填写一项，省略时使用各作品发布者作为线索。`terms` 指定各品牌在目标平台的实际搜索词，`video_links` 保存人工核对过的作品链接，`reviews` 保存归属核对结论及公开依据。链接在保存前会去掉凭据及跟踪参数。未提供人工结论的线索会标记为待核实。
 
 ```json
 {
@@ -95,6 +95,8 @@ competitor-watch batch --input data/seed_accounts.csv
 competitor-watch report --kind posts --format csv --output outputs/posts.csv
 pytest
 ```
+
+`batch` 按剩余有效行数均分当前可用预算，后续行可使用前面缓存命中或结算后节省的额度。完成后统一导出到 `outputs/latest_scan.csv` 和 `outputs/latest_scan.jsonl`。部分行失败时仍保存成功结果并返回非零退出码，全部失败时保留上次导出。
 
 ## 关键边界
 - 以封面、标题、正文为主，不下载原片、不做关键帧分析。

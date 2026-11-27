@@ -1,5 +1,5 @@
-import pytest
 import httpx
+import pytest
 
 from catering_watch.apify import ApifyClient, ApifyError, StartRejected
 
@@ -20,25 +20,30 @@ def test_start_and_page_use_auth_cap_and_physical_offsets(monkeypatch):
     monkeypatch.setattr(
         httpx, "Client", lambda **kw: client_type(transport=httpx.MockTransport(handle), **kw)
     )
-    client = ApifyClient(token="test")
-    assert client.start("vendor/actor", {"max_items": 1}, 0.1, "latest")["id"] == "run1"
-    assert client.page("dataset1", 100, 100) == [{"note_id": "abc"}]
+    with ApifyClient(token="test") as client:
+        assert client.start("vendor/actor", {"max_items": 1}, 0.1, "latest")["id"] == "run1"
+        assert client.page("dataset1", 100, 100) == [{"note_id": "abc"}]
+    assert client.client.is_closed
 
 
 @pytest.mark.parametrize(
     "status,rejected",
     [(400, True), (401, True), (403, True), (422, True), (408, False), (500, False)],
 )
-def test_start_rejection_keeps_safe_provider_diagnostics(status, rejected):
+def test_start_rejection_keeps_safe_provider_diagnostics(status, rejected, monkeypatch):
     def respond(request):
         return httpx.Response(
             status, json={"error": {"type": "invalid-input", "message": "private-input"}}
         )
 
-    client = ApifyClient("test")
-    with httpx.Client(transport=httpx.MockTransport(respond)) as http:
-        client.client = http
+    client_type = httpx.Client
+    monkeypatch.setattr(
+        httpx, "Client", lambda **kw: client_type(transport=httpx.MockTransport(respond), **kw)
+    )
+    with ApifyClient("test") as client:
         with pytest.raises(ApifyError, match="invalid-input") as error:
             client.start("vendor/actor", {}, 0.1, "latest")
+        with pytest.raises(ApifyError, match=f"^Actor status: HTTP {status}$"):
+            client.status("opaque-run")
     assert isinstance(error.value, StartRejected) is rejected
     assert "private-input" not in str(error.value)

@@ -1,6 +1,6 @@
 """Map public search Actor responses before projecting the durable dataset cache."""
 
-from .adapters import DouyinAdapter, XiaohongshuAdapter
+from .adapters import DouyinAdapter, XiaohongshuAdapter, verification_text
 
 
 def as_dict(value):
@@ -39,11 +39,8 @@ class PublicDouyin(PublicSearch, DouyinAdapter):
             or author.get("sec_uid")
             or meta.get("secUid"),
             "author_user_id": row.get("author_user_id") or author.get("uid") or meta.get("id"),
-            "verification_text": row.get("verification_text")
-            or row.get("author_enterprise_verify_reason")
-            or row.get("enterprise_verify_reason")
-            or author.get("enterprise_verify_reason")
-            or row.get("author_custom_verify")
+            "verification_text": verification_text(author)
+            or verification_text(row)
             or meta.get("verificationReason"),
             "share_url": row.get("share_url") or row.get("shareUrl") or row.get("url"),
             "video_duration_ms": row.get("video_duration_ms")
@@ -57,19 +54,30 @@ class PublicRednote(PublicSearch, XiaohongshuAdapter):
     price_per_item = 0.006
 
     def prepare_row(self, row):
-        if row.get("note_id"):
-            return row
         user = as_dict(row.get("user"))
-        pid = row.get("id")
+        pid = row.get("note_id") or row.get("id")
+        cover = row.get("cover")
         return {
+            **row,
             "note_id": pid,
-            "note_url": f"https://www.xiaohongshu.com/explore/{pid}" if pid else None,
+            "note_url": row.get("note_url")
+            or row.get("url")
+            or (f"https://www.xiaohongshu.com/explore/{pid}" if pid else None),
             "title": row.get("title") or row.get("desc"),
-            "content": row.get("desc"),
-            "note_type": row.get("type"),
-            "author_name": user.get("nickname"),
-            "author_user_id": user.get("userid") or user.get("user_id"),
-            "publish_time": row.get("timestamp"),
+            "content": row.get("content") or row.get("desc"),
+            "note_type": row.get("note_type") or row.get("type"),
+            "author_name": row.get("author_name") or user.get("nickname"),
+            "author_user_id": row.get("author_user_id")
+            or user.get("userid")
+            or user.get("user_id"),
+            "author_profile_url": row.get("author_profile_url") or user.get("profile_url"),
+            "verification_text": verification_text(row) or verification_text(user),
+            "cover_image_url": row.get("cover_image_url")
+            or row.get("cover_url")
+            or (cover if isinstance(cover, str) else as_dict(cover).get("url_default")),
+            "video_duration_ms": row.get("video_duration_ms")
+            or as_dict(row.get("video")).get("duration_ms"),
+            "publish_time": row.get("publish_time") or row.get("timestamp"),
         }
 
 

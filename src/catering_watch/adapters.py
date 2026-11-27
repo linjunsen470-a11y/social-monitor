@@ -18,6 +18,21 @@ def channels_account_ids(row):
     return {k: str(row[k]) for k in ("channelId", "finderUserName", "username") if row.get(k)}
 
 
+def verification_text(row):
+    for key in (
+        "verifiedEntity",
+        "author_enterprise_verify_reason",
+        "enterprise_verify_reason",
+        "verification_text",
+        "author_custom_verify",
+        "verification_label",
+    ):
+        value = row.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 @dataclass
 class SearchResult:
     platform: str
