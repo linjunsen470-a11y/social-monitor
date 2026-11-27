@@ -7,7 +7,6 @@ Agent-first Python CLI for public competitor research across Douyin, WeChat Chan
 - Database：`catering_monitor`
 - Schema：`catering_watch`
 - Runtime role：`catering_watch_app`（仅限 schema 读写）
-- 首轮试采结果收录在 `FIRST_RUN_RESULTS.md`。
 - Apify REST 鉴权及三平台采集已有实测记录。本次开发验收使用历史响应回放。
 - 没有创建定时任务或部署服务。
 
@@ -67,7 +66,7 @@ Excel 包含竞品三端核查、微信视频作品、跨平台作品证据、�
 competitor-watch research --query "广州食堂承包" --replay data/replays/runs.json --max-details 0 --execute
 ```
 
-可选的 `--review data/replays/review.json` 可与在线检索或回放合用。其中 `selection` 将选中的微信 exportId 映射到品牌名，省略时使用各作品发布者作为线索。`terms` 指定各品牌在目标平台的实际搜索词，`video_links` 保存人工核对过的作品链接，`reviews` 保存归属核对结论及公开依据。未提供人工结论的线索会标记为待核实。
+可选的 `--review data/replays/review.json` 可与在线检索或回放合用。其中 `selection` 将选中的微信 exportId 映射到品牌名，至少填写一项，省略时使用各作品发布者作为线索。`terms` 指定各品牌在目标平台的实际搜索词，`video_links` 保存人工核对过的作品链接，`reviews` 保存归属核对结论及公开依据。链接在保存前会去掉凭据及跟踪参数。未提供人工结论的线索会标记为待核实。
 
 ```json
 {
@@ -96,6 +95,8 @@ competitor-watch report --kind posts --format csv --output outputs/posts.csv
 pytest
 ```
 
+`batch` 按剩余有效行数均分当前可用预算，后续行可使用前面缓存命中或结算后节省的额度。完成后统一导出到 `outputs/latest_scan.csv` 和 `outputs/latest_scan.jsonl`。部分行失败时仍保存成功结果并返回非零退出码，全部失败时保留上次导出。
+
 ## 关键边界
 - 以封面、标题、正文为主，不下载原片、不做关键帧分析。
 - 元数据匹配只产生候选，不证明两个视频文件相同。
@@ -123,7 +124,7 @@ competitor-watch report --kind reposts --format jsonl --output outputs/reposts.j
 
 ## 版本库约定
 
-提交源码、测试、种子样例和开发说明。实际连接信息放在本地 `.env` 或运行环境的 Secrets 中。报告写到 `outputs/`，构建产物、缓存、压缩包和本地配置由 Git 忽略。
+提交源码、测试、种子样例和开发说明。实际连接信息放在本地 `.env` 或运行环境的 Secrets 中。默认报告写到 `outputs/`。本地回放放在 `data/replays/`，原始数据放在 `data/raw/`。Git 会忽略这些目录、Excel 工作簿和 Python 构建产物。PR 检查使用临时 PostgreSQL 和模拟 Apify 响应。
 
 ## 账号级追踪与恢复
 

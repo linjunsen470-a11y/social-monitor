@@ -2,7 +2,6 @@
 
 from collections import Counter
 from pathlib import Path
-from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -10,12 +9,12 @@ from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from psycopg.types.json import Jsonb
 
-from .adapters import ChannelsAdapter, channels_account_ids
+from .adapters import ChannelsAdapter, channels_account_ids, verification_text
 from .apify import ApifyError, safe_error
 from .config import settings
-from .db import connect, stored_post
+from .db import PostAliasConflict, connect, stored_post
 from .ingest import clean, replay_fields
-from .matrix import CATALOG, ownership, search_outcome, search_terms
+from .matrix import CATALOG, matches_search_term, ownership, search_outcome
 from .research_adapters import PEER_SEARCH
 from .tracking import catalog_for
 
@@ -24,35 +23,48 @@ def validate_review(notes):
     """Validate optional review inputs before any paid lookup."""
     if not isinstance(notes, dict):
         raise TypeError("人工核对文件须为 JSON 对象")
-    for field in ("selection", "terms", "video_links", "reviews"):
-        if not isinstance(notes.get(field, {}), dict):
-            raise TypeError(f"{field} 须为 JSON 对象")
 
     def text(value):
         return isinstance(value, str) and bool(value.strip())
 
     def public_url(value):
-        return (
+        if (
             text(value)
-            and urlsplit(value).scheme in ("http", "https")
-            and bool(urlsplit(value).hostname)
-        )
+            and value.lower().startswith(("https://", "http://"))
+            and not any(c.isspace() for c in value)
+            and (link := clean(value))
+        ):
+            return link
+        raise ValueError("人工核对链接需要公开 HTTP(S) 地址")
 
+    unknown = notes.keys() - {"selection", "terms", "video_links", "reviews"}
+    if unknown:
+        raise ValueError(f"未知的人工核对字段 {', '.join(sorted(unknown))}")
+    for field, entries in notes.items():
+        if not isinstance(entries, dict) or not all(text(k) for k in entries):
+            raise ValueError(f"{field} 须为键名非空的 JSON 对象")
+    if "selection" in notes and not notes["selection"]:
+        raise ValueError("selection 需要至少一条作品，使用全部发布者时请省略该字段")
     if not all(text(v) for v in notes.get("selection", {}).values()):
         raise ValueError("每条所选作品需要非空品牌或昵称")
-    if not all(public_url(v) for v in notes.get("video_links", {}).values()):
-        raise ValueError("人工作品链接需要 HTTP(S) 地址")
     for terms in notes.get("terms", {}).values():
         if not isinstance(terms, dict) or not all(
             k in PEER_SEARCH and text(v) for k, v in terms.items()
         ):
             raise ValueError("terms 需要平台名及非空检索词")
-    for entry in notes.get("reviews", {}).values():
+    reviews = {}
+    for brand, entry in notes.get("reviews", {}).items():
         if not isinstance(entry, dict) or not text(entry.get("conclusion")):
             raise ValueError("人工核对结论需要填写 conclusion")
         urls = entry.get("urls", [])
-        if not isinstance(urls, list) or not all(public_url(v) for v in urls):
-            raise ValueError("urls 需要公开依据链接数组")
+        if not isinstance(urls, list):
+            raise TypeError("urls 需要公开依据链接数组")
+        reviews[brand] = {"conclusion": entry["conclusion"], "urls": [public_url(v) for v in urls]}
+    return {
+        **notes,
+        "reviews": reviews,
+        "video_links": {k: public_url(v) for k, v in notes.get("video_links", {}).items()},
+    }
 
 
 class Research:
@@ -69,6 +81,18 @@ class Research:
                 ):
                     raise ValueError(f"回放第 {index} 条需要 platform、operation、query 和 run_id")
                 key = (entry["platform"], entry["operation"], entry["query"])
+                if not (
+                    (key[0] == "channels" and key[1] in {"videoSearch", "videoDetail"})
+                    or (key[0] in PEER_SEARCH and key[1] == "public_post_search")
+                ):
+                    raise ValueError(f"回放第 {index} 条的平台或操作无效")
+                if entry.get("status", "SUCCEEDED") not in (
+                    "SUCCEEDED",
+                    "FAILED",
+                    "ABORTED",
+                    "TIMED-OUT",
+                ):
+                    raise ValueError(f"回放第 {index} 条需要有效的采集终态")
                 rows = entry.get("rows")
                 if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
                     raise ValueError(f"回放第 {index} 条的 rows 须为对象数组")
@@ -131,6 +155,37 @@ class Research:
         check["count"] = len(items)
         return items
 
+    def _enrich_channel(self, adapter, item, allow_detail):
+        if self.archive is None and not item.author_id:
+            previous = stored_post("channels", item.post_id, item.raw)
+            if previous and previous["author_id"]:
+                item.author_id = previous["author_id"]
+                item.author_name = item.author_name or previous["author_name"]
+                item.author_url = item.author_url or previous["author_url"]
+                if not verification_text(item.raw) and previous["verification_text"]:
+                    item.raw["verification_text"] = previous["verification_text"]
+                identifiers = channels_account_ids(previous["metadata"].get("raw_payload", {}))
+                item.raw = identifiers | item.raw
+        eid = item.raw.get("exportId")
+        if not allow_detail or not eid or item.author_id:
+            return item, None, False
+        rows = self.lookup(adapter, "videoDetail", eid, adapter.reference_payload(eid), 1)
+        check = self.checks[-1]
+        if not rows:
+            return item, None, check["status"] not in {"预算不足", "缺少回放记录"}
+        detail = rows[0]
+        if any(
+            item.raw.get(k) and detail.raw.get(k) and str(item.raw[k]) != str(detail.raw[k])
+            for k in ("exportId", "docID", "hashDocID", "videoId")
+        ):
+            check["status"] = "详情标识冲突"
+            self.incomplete = True
+            return item, None, True
+        raw = item.raw | replay_fields(detail.raw)
+        if detail.title:
+            raw["title"] = detail.title
+        return adapter.normalize(raw), check["run_id"], True
+
     def collect(self, queries, limit, max_details, peer_limit, review):
         channels = ChannelsAdapter()
         sources = {}
@@ -165,36 +220,23 @@ class Research:
         for brand, item, query in sources.values():
             eid = item.raw.get("exportId")
             search_run = item.raw["collection_run_id"]
-            detail_run = None
-            if self.archive is None and not item.author_id:
-                previous = stored_post("channels", item.post_id, item.raw)
-                if previous and previous["author_id"]:
-                    item.author_id = previous["author_id"]
-                    if not item.author_name:
-                        item.author_name = previous["author_name"]
-                    item.raw.update(
-                        channels_account_ids(previous["metadata"].get("raw_payload", {}))
-                    )
-            if max_details and eid and not item.author_id:
-                max_details -= 1
-                rows = self.lookup(channels, "videoDetail", eid, channels.reference_payload(eid), 1)
-                if rows:
-                    detail = rows[0]
-                    # The request has exactly one source ID. Reject a contradictory response.
-                    if any(
-                        item.raw.get(k)
-                        and detail.raw.get(k)
-                        and str(item.raw[k]) != str(detail.raw[k])
-                        for k in ("exportId", "docID", "hashDocID", "videoId")
-                    ):
-                        self.checks[-1]["status"] = "详情标识冲突"
-                        self.incomplete = True
-                    else:
-                        detail_run = detail.raw["collection_run_id"]
-                        raw = item.raw | replay_fields(detail.raw)
-                        if detail.title:
-                            raw["title"] = detail.title
-                        item = channels.normalize(raw)
+            try:
+                item, detail_run, checked = self._enrich_channel(channels, item, max_details > 0)
+                if checked:
+                    max_details -= 1
+                self.persist(item)
+            except PostAliasConflict as exc:
+                self.checks.append(
+                    {
+                        "platform": "channels",
+                        "operation": "videoSearch",
+                        "query": eid or item.post_id,
+                        "status": str(exc),
+                        "run_id": search_run,
+                    }
+                )
+                self.incomplete = True
+                continue
             brand = brand or item.author_name
             if brand:
                 brands.setdefault(brand, {})
@@ -208,7 +250,6 @@ class Research:
                     }
                 )
                 self.incomplete = True
-            self.persist(item)
             videos.append(
                 dict(
                     evidence(brand, item),
@@ -246,7 +287,8 @@ class Research:
                     proofs = {
                         proof
                         for entry in catalog
-                        if brand in search_terms(entry) and (proof := ownership(entry, owner_post))
+                        if matches_search_term(entry, brand)
+                        and (proof := ownership(entry, owner_post))
                     }
                     if len(proofs) == 1:
                         peer["ownership_evidence"] = proofs.pop()
@@ -274,7 +316,7 @@ def evidence(brand, item):
         "title": item.title,
         "body": item.body,
         "published_at": item.published_at,
-        "verification": item.raw.get("verification_text"),
+        "verification": verification_text(item.raw),
         "run_id": item.raw["collection_run_id"],
     }
 
@@ -331,10 +373,10 @@ def export_report(report_id, output: Path):
             [
                 brand,
                 counts[brand],
-                states["douyin"],
-                states["xiaohongshu"],
+                states.get("douyin", "尚未查询"),
+                states.get("xiaohongshu", "尚未查询"),
                 data["reviews"].get(brand, {}).get("conclusion", "归属待核实"),
-                "\n".join(data["reviews"].get(brand, {}).get("urls", [])),
+                "\n".join(clean(url) for url in data["reviews"].get(brand, {}).get("urls", [])),
             ]
             for brand, states in data["brands"].items()
         ),
@@ -367,7 +409,14 @@ def export_report(report_id, output: Path):
         ("跨平台作品证据", "peers", {"ownership_evidence": "自营依据"}),
     ]:
         fields = columns | extra
-        sheet(name, list(fields.values()), ([r.get(k) for k in fields] for r in data[key]))
+        sheet(
+            name,
+            list(fields.values()),
+            (
+                [clean(r.get(k)) if k == "reviewed_url" else r.get(k) for k in fields]
+                for r in data[key]
+            ),
+        )
     sheet(
         "策略观察",
         ["采购关切", "作品中出现的用语", "命中微信作品数", "样本作品链接"],

@@ -1,6 +1,10 @@
 import re
+import socket
 import unicodedata
+from io import BytesIO
+from ipaddress import ip_address
 
+import httpx
 from rapidfuzz.fuzz import ratio
 
 from . import __version__
@@ -97,10 +101,50 @@ def compare_posts(a, b, brand=None):
     }
 
 
-def cover_feature(url, platform=None):
-    from io import BytesIO
+def _download_cover(url, headers):
+    target = httpx.URL(url)
+    for _ in range(5):
+        if (
+            target.scheme not in {"http", "https"}
+            or not target.host
+            or target.userinfo
+            or target.port not in (None, 80, 443)
+        ):
+            return None, "blocked_url"
+        host = target.raw_host.decode("ascii")
+        addresses = socket.getaddrinfo(
+            host, target.port or (443 if target.scheme == "https" else 80), type=socket.SOCK_STREAM
+        )
+        ips = [ip_address(address[4][0]) for address in addresses]
+        if not ips or any(not ip.is_global or ip.is_multicast or ip.is_reserved for ip in ips):
+            return None, "blocked_url"
+        # Dial the checked address. Preserve the original host for HTTP and TLS verification.
+        with (
+            httpx.Client(timeout=12, trust_env=False) as client,
+            client.stream(
+                "GET",
+                target.copy_with(host=str(ips[0])),
+                headers={**headers, "Host": target.netloc.decode("ascii")},
+                extensions={"sni_hostname": host},
+                follow_redirects=False,
+            ) as response,
+        ):
+            if response.has_redirect_location:
+                target = target.join(response.headers["location"])
+                continue
+            if not response.is_success:
+                return None, f"http_{response.status_code}"
+            data = BytesIO()
+            for chunk in response.iter_bytes(chunk_size=65536):
+                if data.tell() + len(chunk) > 8_000_000:
+                    return None, "too_large"
+                data.write(chunk)
+            data.seek(0)
+            return data, "ok"
+    return None, "too_many_redirects"
 
-    import httpx
+
+def cover_feature(url, platform=None):
     import imagehash
     from PIL import Image
 
@@ -115,21 +159,15 @@ def cover_feature(url, platform=None):
         }.get(platform)
         if referer:
             headers["Referer"] = referer
-        with httpx.stream(
-            "GET", url, headers=headers, timeout=12, follow_redirects=True
-        ) as response:
-            if response.is_error:
-                return None, f"http_{response.status_code}"
-            data = BytesIO()
-            for chunk in response.iter_bytes():
-                data.write(chunk)
-                if data.tell() > 8_000_000:
-                    return None, "too_large"
-        data.seek(0)
+        data, status = _download_cover(url, headers)
+        if data is None:
+            return None, status
         with Image.open(data) as image:
             image.thumbnail((512, 512))
             return str(imagehash.phash(image.convert("RGB"))), "ok"
-    except httpx.RequestError:
+    except (httpx.RequestError, socket.gaierror):
         return None, "network_error"
+    except httpx.InvalidURL:
+        return None, "blocked_url"
     except (OSError, ValueError, Image.DecompressionBombError):
         return None, "decode_error"

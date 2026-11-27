@@ -1,6 +1,7 @@
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC
 from decimal import Decimal
 from uuid import uuid4
 
@@ -45,6 +46,7 @@ def project(monkeypatch):
     if not dsn.startswith("postgresql:///postgres?host=/tmp/"):
         pytest.skip("set CATERING_TEST_DATABASE_URL to an isolated local PostgreSQL Unix socket")
     from dataclasses import replace
+
     from catering_watch import db
 
     key = "test-" + uuid4().hex
@@ -62,6 +64,12 @@ class Provider:
         self.starts = 0
         self.offsets = []
         self.fail = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        pass
 
     def start(self, *args):
         self.starts += 1
@@ -102,6 +110,39 @@ def test_resume_pages_and_ledger(project, monkeypatch):
     assert ledger[0]["amount_usd"] < reserved == Decimal(".7")
 
 
+def test_two_workers_can_read_the_same_page_and_settle_it_once(project, monkeypatch):
+    entered = threading.Event()
+    both_reading = threading.Barrier(2)
+
+    class Concurrent(Provider):
+        def page(self, dataset, offset, limit):
+            if offset == 0:
+                entered.set()
+                both_reading.wait(timeout=5)
+            return [{"aweme_id": str(i)} for i in range(offset, min(offset + limit, 103))]
+
+    monkeypatch.setattr(ingest.time, "sleep", lambda _: None)
+    adapter = DouyinAdapter()
+    client = ingest.DurableClient(adapter, Concurrent())
+    args = (adapter.actor, {"operation": "search_videos"}, ".55")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(client.run, *args)
+        assert entered.wait(5)
+        second = executor.submit(client.run, *args)
+        run, items = first.result(timeout=10)
+        resumed, same_items = second.result(timeout=10)
+    assert items == same_items == [{"aweme_id": str(i)} for i in range(103)]
+    assert resumed["command_cost_usd"] == 0 and run["command_cost_usd"] == Decimal(".55")
+    with connect() as conn:
+        assert (
+            conn.execute(
+                "SELECT count(*) AS n FROM catering_watch.cost_ledger WHERE fetch_run_id=%s",
+                (run["fetch_id"],),
+            ).fetchone()["n"]
+            == 1
+        )
+
+
 def test_concurrent_claim_and_unknown_start(project):
     entered, release = threading.Event(), threading.Event()
 
@@ -139,16 +180,19 @@ def test_concurrent_claim_and_unknown_start(project):
 
 
 def test_dynamic_tracking_and_replay(project, monkeypatch):
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     from catering_watch import cli, db, matrix
 
     monkeypatch.setattr(cli, "settings", db.settings)
     brand = "新登记品牌"
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
 
     class FixtureBudget:
         execute = True
-        steps = []
+
+        def __init__(self):
+            self.steps = []
 
         def request(self, platform, payload, limit):
             self.steps.append((platform, payload))
@@ -212,13 +256,15 @@ def test_repeated_evidence(project):
 
 
 def test_account_scan_discovers_once_per_target(project, monkeypatch, tmp_path):
-    from catering_watch import cli, db
+    from datetime import datetime
+
     from typer.testing import CliRunner
-    from datetime import datetime, timezone
+
+    from catering_watch import cli, db
 
     monkeypatch.setattr(cli, "settings", db.settings)
     monkeypatch.chdir(tmp_path)
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
     calls = []
 
     def request(self, platform, payload, limit):
@@ -341,6 +387,7 @@ def test_budget_rejection_settlement_expiry_and_replay(project, monkeypatch):
         rejected = conn.execute(
             "SELECT * FROM catering_watch.fetch_runs WHERE project_key=%s", (project,)
         ).fetchone()
+
     assert (
         rejected["status"] == "FAILED" and rejected["finished_at"] and rejected["reserved_usd"] == 0
     )
@@ -368,6 +415,39 @@ def test_budget_rejection_settlement_expiry_and_replay(project, monkeypatch):
         assert not conn.execute(
             "SELECT 1 FROM catering_watch.dataset_pages WHERE fetch_id=%s", (run["fetch_id"],)
         ).fetchone()
+
+
+def test_failed_requests_charge_only_their_own_reservation(project, monkeypatch):
+    from dataclasses import replace
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ingest, "settings", replace(ingest.settings, apify_token=""))
+        budget = tracking.Budget(".20", True)
+        with pytest.raises(ApifyError, match="未配置"):
+            budget.request("douyin", {"operation": "search_users"}, 10)
+        assert budget.remaining == Decimal(".20")
+
+    class Uncertain(Provider):
+        def start(self, *args):
+            raise ApifyError("启动结果未知")
+
+    monkeypatch.setattr(ingest, "ApifyClient", Uncertain)
+    args = ("douyin", {"operation": "search_videos"}, 10)
+    with pytest.raises(ApifyError, match="启动结果未知"):
+        budget.request(*args)
+    assert budget.remaining == Decimal(".1500")
+    with pytest.raises(ApifyError, match="待核对"):
+        budget.request(*args)
+    assert budget.remaining == Decimal(".1500")
+
+    class Aborted(Provider):
+        def start(self, *args):
+            return {"id": "stopped", "status": "ABORTED", "usageTotalUsd": 0.006}
+
+    monkeypatch.setattr(ingest, "ApifyClient", Aborted)
+    with pytest.raises(ApifyError, match="ABORTED"):
+        budget.request("douyin", {"operation": "search_users"}, 10)
+    assert budget.remaining == Decimal(".1440")
 
 
 def test_signed_cover_survives_replay_and_persistence(project, monkeypatch):
@@ -439,6 +519,59 @@ def test_channels_account_aliases_and_full_page(project, monkeypatch):
     assert cli._persist(ChannelsAdapter().normalize({"docID": "shared"})) not in ids
 
 
+def test_channel_account_promotion_preserves_post_and_nonempty_fields(project):
+    from catering_watch import db
+
+    account = db.upsert_account(
+        "channels",
+        "user",
+        url="https://example.com/u",
+        bio="profile",
+        source_metadata={"username": "user"},
+    )
+    post = db.upsert_post(
+        {
+            "platform": "channels",
+            "post_id": "docID:p",
+            "account_id": account,
+            "url": "https://example.com/p",
+            "cover_url": "https://example.com/i",
+        }
+    )
+    assert (
+        db.upsert_account(
+            "channels",
+            "channel",
+            url="",
+            bio="",
+            verification="企业",
+            source_metadata={"channelId": "channel", "username": "user"},
+        )
+        == account
+    )
+    assert (
+        db.upsert_post({"platform": "channels", "post_id": "docID:p", "url": "", "cover_url": ""})
+        == post
+    )
+    saved = db.stored_post("channels", "docID:p")
+    assert (saved["author_id"], saved["verification_text"], saved["author_url"]) == (
+        "channel",
+        "企业",
+        "https://example.com/u",
+    )
+    assert (saved["post_url"], saved["cover_url"]) == (
+        "https://example.com/p",
+        "https://example.com/i",
+    )
+    tracking.register("品牌", "channels", "user", "https://example.com/proof")
+    db.upsert_account(
+        "channels", "other", source_metadata={"channelId": "other", "username": "user"}
+    )
+    with connect() as conn:
+        (brand,) = tracking.catalog_for(conn, [])
+    assert brand["accounts"][0]["ids"] == []
+
+
 def test_partial_source_page_keeps_bookmark_until_complete(project, monkeypatch):
     from catering_watch import cli, db
 
@@ -469,13 +602,15 @@ def test_partial_source_page_keeps_bookmark_until_complete(project, monkeypatch)
 
 
 def test_verified_peer_search_uses_actor_fields(project, monkeypatch, tmp_path):
-    from datetime import datetime, timezone
+    from datetime import datetime
+
     from typer.testing import CliRunner
+
     from catering_watch import cli, db
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(cli, "settings", db.settings)
-    now = datetime.now(timezone.utc).timestamp()
+    now = datetime.now(UTC).timestamp()
     calls = []
 
     def request(self, platform, payload, limit):
@@ -618,13 +753,14 @@ def test_real_scan_cache_avoids_reprocessing_persisted_posts(project, monkeypatc
     provider = Search()
     monkeypatch.setattr(ingest, "ApifyClient", lambda: provider)
     monkeypatch.setattr(cli, "settings", db.settings)
-    args = ("douyin", "品牌", 2, 0.2)
-    rows = cli._cross_search(*args)
-    assert len(rows) == 2 and not any(r["cache_hit"] for r in rows)
+    args = ("douyin", "品牌", 2, tracking.Budget(0.2, True))
+    rows, ok = cli._cross_search(*args)
+    assert ok and len(rows) == 2 and not any(r["cache_hit"] for r in rows)
     monkeypatch.setattr(
         cli, "_persist", lambda *a, **kw: pytest.fail("processed a cached post twice")
     )
-    cached = cli._cross_search(*args)
+    cached, ok = cli._cross_search(*args)
+    assert ok
     assert len(cached) == 2 and all(r["cache_hit"] for r in cached)
     assert provider.starts == 2
 
@@ -641,7 +777,8 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
         monkeypatch.setattr(module, "settings", db.settings)
     monkeypatch.setattr(tracking.Budget, "request", lambda *a, **kw: pytest.fail("paid call"))
     monkeypatch.setattr(cli, "_ensure_cover", lambda *a, **kw: pytest.fail("network call"))
-    brand = "某团餐"
+    brand = "侯宝贝"
+    entity = next(b["entities"][0] for b in research.CATALOG if b["name"] == brand)
     archive = [
         (
             "channels",
@@ -653,7 +790,15 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
             "channels",
             "videoDetail",
             "export/x",
-            [{"videoId": "vid", "username": "wx-id", "nickname": brand, "title": ""}],
+            [
+                {
+                    "videoId": "vid",
+                    "username": "wx-id",
+                    "nickname": brand,
+                    "title": "",
+                    "verifiedEntity": entity,
+                }
+            ],
         ),
         (
             "douyin",
@@ -671,16 +816,32 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
                     "user": {"userid": "xhs-id", "nickname": brand},
                     "type": "normal",
                     "desc": "餐标",
+                    "author_enterprise_verify_reason": entity,
                 }
             ],
         ),
     ]
     records = [
-        dict(platform=p, operation=o, query=q, rows=rows, run_id=f"run-{i}")
+        {"platform": p, "operation": o, "query": q, "rows": rows, "run_id": f"run-{i}"}
         for i, (p, o, q, rows) in enumerate(archive)
     ]
     manifest = tmp_path / "inputs.json"
     output = tmp_path / "out.xlsx"
+    review = tmp_path / "review.json"
+    review.write_text(
+        json.dumps(
+            {
+                "selection": {"export/x": brand},
+                "video_links": {"export/x": "https://example.com/video?access_token=private"},
+                "reviews": {
+                    brand: {
+                        "conclusion": "已核对",
+                        "urls": ["https://example.com/proof?xsec_token=private"],
+                    }
+                },
+            }
+        )
+    )
     args = [
         "research",
         "--query",
@@ -694,7 +855,7 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
     runner = CliRunner()
     for complete in (True, False):
         manifest.write_text(json.dumps(records if complete else records[:-1]))
-        result = runner.invoke(cli.app, args)
+        result = runner.invoke(cli.app, [*args, "--review", str(review)] if complete else args)
         assert result.exit_code == (0 if complete else 1), (result.output, result.exception)
         rid = result.output.split("调研 ID ")[1].splitlines()[0]
         book = load_workbook(output)
@@ -703,7 +864,18 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
         assert "=menu" in wx and all(cell.data_type != "f" for cell in book["微信视频作品"][2])
         assert len(list(book["跨平台作品证据"].values)) == (3 if complete else 2)
         status = list(book["竞品三端核查"].values)[1][3]
-        assert status == ("有候选" if complete else "缺少回放记录")
+        assert status == ("有候选；有自营依据" if complete else "缺少回放记录")
+        if complete:
+            assert entity in wx and "https://example.com/video" in wx
+            with connect() as conn:
+                evidence = conn.execute(
+                    "SELECT evidence FROM catering_watch.research_reports WHERE id=%s", (rid,)
+                ).fetchone()["evidence"]
+            assert "private" not in json.dumps(evidence)
+            assert evidence["peers"][-1]["ownership_evidence"] == entity
+            assert db.stored_post("douyin", "d")["metadata"]["media_type"] == "video"
+            assert db.stored_post("xiaohongshu", "n")["metadata"]["media_type"] == "image"
+            assert db.stored_post("channels", "docID:doc")["verification_text"] == entity
         copy = tmp_path / "export.xlsx"
         assert (
             runner.invoke(cli.app, ["research-report", rid, "--output", str(copy)]).exit_code == 0
@@ -720,11 +892,12 @@ def test_research_real_cli_replay_and_offline_export(project, monkeypatch, tmp_p
 
 def test_research_online_budget_and_actor_protocol(project, monkeypatch, tmp_path):
     from typer.testing import CliRunner
+
     from catering_watch import cli, db, research
 
     starts = []
 
-    class Transport:
+    class Transport(Provider):
         def start(self, actor, payload, cap, build):
             starts.append((actor, payload, cap))
             assert cap > 0
@@ -769,3 +942,52 @@ def test_research_online_budget_and_actor_protocol(project, monkeypatch, tmp_pat
             (project,),
         ).fetchone()
     assert red == {"current_name": "red", "title": "团餐菜单"}
+
+
+def test_research_alias_conflict_saves_other_evidence(project, monkeypatch, tmp_path):
+    import json
+
+    from openpyxl import load_workbook
+    from typer.testing import CliRunner
+
+    from catering_watch import cli, db, research
+
+    for module in (cli, research):
+        monkeypatch.setattr(module, "settings", db.settings)
+    for ids in ({"docID": "first"}, {"exportId": "second"}):
+        cli._persist(ChannelsAdapter().normalize(ids), fetch_cover=False)
+    rows = [
+        {"docID": "first", "exportId": "second", "username": "conflict-only", "nickname": "待核对"},
+        {"docID": "ok", "username": "good", "nickname": "品牌"},
+    ]
+    archive = [
+        {
+            "platform": "channels",
+            "operation": "videoSearch",
+            "query": "q",
+            "rows": rows,
+            "run_id": "source",
+        }
+    ]
+    for platform in ("douyin", "xiaohongshu"):
+        archive.append(
+            {
+                "platform": platform,
+                "operation": "public_post_search",
+                "query": "品牌",
+                "rows": [],
+                "run_id": platform,
+            }
+        )
+    path = tmp_path / "archive.json"
+    path.write_text(json.dumps(archive))
+    output = tmp_path / "results.xlsx"
+    result = CliRunner().invoke(
+        cli.app,
+        ["research", "--query", "q", "--execute", "--replay", str(path), "--output", str(output)],
+    )
+    assert result.exit_code == 1 and "调研 ID" in result.output
+    book = load_workbook(output)
+    assert [r[4] for r in list(book["微信视频作品"].values)[1:]] == ["docID:ok"]
+    assert any("别名冲突" in r[3] for r in list(book["检索记录"].values)[1:])
+    assert db.db_status()["accounts"] == 1

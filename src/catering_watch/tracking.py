@@ -1,6 +1,5 @@
 """Account discovery and incremental catalogue sync using bounded Actor operations."""
 
-import os
 from copy import deepcopy
 from decimal import ROUND_CEILING, Decimal
 from urllib.parse import urljoin, urlsplit
@@ -8,9 +7,8 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from psycopg.types.json import Jsonb
 
-from .adapters import ADAPTERS, channels_account_ids
-from .apify import StartRejected
-from .config import settings
+from .adapters import ADAPTERS, channels_account_ids, verification_text
+from .config import actor_build, settings
 from .db import connect, upsert_account
 from .ingest import ACTIVE, DurableClient, InsufficientBudget, clean, key_for
 
@@ -88,12 +86,20 @@ def catalog_for(db, base):
         for uid in ids:
             aliases.setdefault(uid, set()).update(ids)
             if row["source_metadata"].get("channelId"):
-                canonical[uid] = row["source_metadata"]["channelId"]
+                canonical.setdefault(uid, set()).add(str(row["source_metadata"]["channelId"]))
     for brand in brands.values():
         for account in brand.get("accounts", []):
             if account["platform"] == "channels":
-                account["ids"] = sorted(aliases.get(account["id"], {account["id"]}))
-                account["id"] = canonical.get(account["id"], account["id"])
+                uid = account["id"]
+                owners = canonical.get(uid, set())
+                if len(owners) > 1:
+                    account["ids"] = []
+                    continue
+                account["ids"] = sorted(
+                    alias for alias in aliases.get(uid, {uid}) if len(canonical.get(alias, ())) <= 1
+                )
+                if len(owners) == 1:
+                    account["id"] = next(iter(owners))
     return list(brands.values())
 
 
@@ -110,8 +116,8 @@ class Budget:
             Decimal(".0001"), rounding=ROUND_CEILING
         )
         status = None
-        if not self.execute and settings.database_url and "<" not in settings.database_url:
-            fp = key_for(adapter.actor, payload, os.getenv("APIFY_BUILD", "latest"))
+        if not self.execute and settings.database_url:
+            fp = key_for(adapter.actor, payload, actor_build())
             with connect() as db:
                 row = db.execute(
                     """SELECT status FROM catering_watch.fetch_runs WHERE project_key=%s
@@ -142,19 +148,21 @@ class Budget:
                 self.remaining -= cap
             return None, []
         # claim() checks the cache, the reservation and both limits in one transaction.
+        charge = Decimal(0)
+
+        def on_cost(amount):
+            nonlocal charge
+            charge = amount
+
         try:
-            run, rows = DurableClient(adapter).run(adapter.actor, payload, cap)
+            run, rows = DurableClient(adapter).run(adapter.actor, payload, cap, on_cost=on_cost)
         except InsufficientBudget:
             step["skipped"] = True
             return None, []
-        except StartRejected:
-            raise
-        except Exception:
-            self.remaining -= cap
-            raise
+        finally:
+            self.remaining = max(Decimal(0), self.remaining - charge)
+            step["charged_or_held_usd"] = str(charge)
         step["cached_or_active"] = run["status"] if run["cached"] else None
-        step["charged_or_held_usd"] = str(run["command_cost_usd"])
-        self.remaining = max(Decimal(0), self.remaining - run["command_cost_usd"])
         return run, rows
 
 
@@ -214,15 +222,7 @@ def search_accounts(platform, term, budget, limit):
             "channelTitle",
             "title",
         )
-        verification = field(
-            row,
-            "verifiedEntity",
-            "verification_text",
-            "verification_label",
-            "author_enterprise_verify_reason",
-            "enterprise_verify_reason",
-            "author_custom_verify",
-        )
+        verification = verification_text(row)
         bio = field(row, "bio", "introduction", "desc", "description", "signature")
         url = clean(field(row, "profile_url", "author_profile_url", "creatorUrl", "url"))
         followers = row.get("follower_count", row.get("fansCount", row.get("fans_count")))
@@ -271,7 +271,7 @@ def sync(brand, platform, uid, budget, limit, persist, *, backfill=False):
     if budget.execute:
         register(brand, platform, uid)
     state = None
-    if budget.execute or (settings.database_url and "<" not in settings.database_url):
+    if budget.execute or settings.database_url:
         with connect() as db:
             state = db.execute(
                 """SELECT next_cursor,backfill_done,extract(epoch from now()-interval '6 months') AS cutoff

@@ -15,6 +15,7 @@ CATALOG = json.loads(
     ).read_text(encoding="utf-8")
 )
 REPORT_FIELDS = {
+    "scan": ["status"],
     "reposts": [
         "competitor",
         "source_platform",
@@ -25,7 +26,7 @@ REPORT_FIELDS = {
         "conclusion",
         "window_start",
         "window_end",
-    ]
+    ],
 }
 
 
@@ -33,10 +34,16 @@ def search_terms(brand):
     return list(dict.fromkeys([brand["name"], *brand.get("entities", []), *brand["aliases"]]))
 
 
+def matches_search_term(brand, value):
+    return isinstance(value, str) and value.casefold() in (
+        t.casefold() for t in search_terms(brand)
+    )
+
+
 def search_outcome(query, items, raw_count):
     if not items:
         return "sparse" if raw_count else "empty"
-    brand = next((b for b in CATALOG if query in search_terms(b)), None)
+    brand = next((b for b in CATALOG if matches_search_term(b, query)), None)
     terms = search_terms(brand) if brand else [query]
     for item in items:
         description = " ".join(filter(None, (item.author_name, item.title, item.body))).casefold()
@@ -166,32 +173,31 @@ def reports(kind, posts, runs, catalog=CATALOG, on_match=None):
             checks = []
             for run in runs:
                 meta = run["metadata"]
-                if run["platform"] != platform or meta.get("query") not in search_terms(brand):
+                if run["platform"] != platform or not matches_search_term(brand, meta.get("query")):
                     continue
                 checks.append(
                     {
                         "status": run["status"],
-                        "run_id": meta.get("run_id"),
+                        "run_id": run.get("provider_run_id") or meta.get("run_id"),
                         "query": meta["query"],
                         "at": run["finished_at"],
                         "outcome": meta.get("outcome", "unknown"),
                     }
                 )
             owned = [p for p in candidates if ownership(brand, p) and video_status(p) is True]
+            outcomes = {c["outcome"] for c in checks if c["status"] == "SUCCEEDED"}
             if owned:
                 status = "已观察到自营视频"
                 row["owned_platform_count"] += 1
-            elif candidates or any(c["outcome"] == "candidate" for c in checks):
+            elif candidates or "candidate" in outcomes:
                 status = (
                     "归属待核实"
                     if not candidates or any(not ownership(brand, p) for p in candidates)
                     else "数据不足"
                 )
-            elif any(
-                c["outcome"] in ("sparse", "unknown") and c["status"] != "FAILED" for c in checks
-            ):
+            elif outcomes & {"sparse", "unknown"}:
                 status = "数据不足"
-            elif any(c["outcome"] in ("empty", "no_relevant") for c in checks):
+            elif outcomes & {"empty", "no_relevant"}:
                 status = "已查未检出"
             else:
                 status = "查询失败" if checks else "尚未查询"
@@ -230,7 +236,7 @@ def read_report(kind, on_match=None):
             ),
         ).fetchall()
         runs = conn.execute(
-            """SELECT platform,status,finished_at,metadata FROM catering_watch.fetch_runs
+            """SELECT platform,status,provider_run_id,finished_at,metadata FROM catering_watch.fetch_runs
             WHERE project_key=%s AND operation IN ('channelSearch','search_users','videoSearch','search_videos','search_notes','public_post_search') AND finished_at BETWEEN %s AND %s
             ORDER BY finished_at""",
             (settings.project_key, window["start"], window["finish"]),

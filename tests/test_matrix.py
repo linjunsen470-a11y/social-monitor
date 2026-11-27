@@ -1,6 +1,6 @@
 import csv
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from typer.testing import CliRunner
@@ -65,22 +65,25 @@ def test_generic_caption_and_cover():
 
 
 def test_empty_project_starts_with_no_observations():
-    end = datetime(2026, 11, 26, 12, tzinfo=timezone.utc)
+    end = datetime(2026, 11, 26, 12, tzinfo=UTC)
     window = {"start": end.replace(month=5), "finish": end}
     for row in assemble_report("coverage", [], [], window):
         assert row["owned_platform_count"] == 0
         assert all(row[p] == "尚未查询" for p in ("douyin", "channels", "xiaohongshu"))
 
 
-def test_failed_and_unsearched():
+@pytest.mark.parametrize("status", ["FAILED", "ABORTED", "TIMED-OUT"])
+def test_failed_and_unsearched(status):
     run = {
         "platform": "douyin",
         "metadata": {"query": "侯宝贝"},
         "finished_at": None,
-        "status": "FAILED",
+        "status": status,
+        "provider_run_id": "observed",
     }
     row = reports("coverage", [], [run], [BRAND])[0]
     assert row["douyin"] == "查询失败"
+    assert row["douyin_checks"][0]["run_id"] == "observed"
     assert row["channels"] == "尚未查询"
 
 
@@ -157,7 +160,8 @@ def test_cache_hit_reuses_posts_without_actor(monkeypatch):
         cli.tracking.Budget, "request", lambda *a: pytest.fail("unexpected Actor call")
     )
     monkeypatch.setattr(cli, "get_posts_by_ids", lambda ids: [row] if ids == [17] else [])
-    result = cli._cross_search("douyin", "侯宝贝", 1, 0.1)
+    result, ok = cli._cross_search("douyin", "侯宝贝", 1, cli.tracking.Budget(0.1, True))
+    assert ok
     assert result[0]["cache_hit"] and result[0]["post_id"] == row["platform_post_id"]
 
 
@@ -172,6 +176,43 @@ def test_search_observation_types():
     assert cli.search_outcome("侯宝贝", [clue], 1) == "candidate"
 
 
+def test_batch_combines_outputs_and_carries_unused_budget(tmp_path, monkeypatch):
+    from decimal import Decimal
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "db_status", dict)
+    caps = []
+
+    def search(platform, query, limit, budget):
+        caps.append(budget.remaining)
+        return [{"title": "  +1", "count": -1}], True
+
+    def scan_url(url, platform, query, limit, budget):
+        caps.append(budget.remaining)
+        budget.remaining -= Decimal(".02")
+        if url == "failed":
+            raise RuntimeError("row unavailable")
+        return [{"title": "=1+1", "url": url}]
+
+    monkeypatch.setattr(cli, "_cross_search", search)
+    monkeypatch.setattr(cli, "_scan_url", scan_url)
+    path = tmp_path / "batch.csv"
+    path.write_text(
+        "platform,url,query,max_items\nother,,invalid,1\ndouyin,,q,2\nchannels,failed,,1\nchannels,ok,,1\n"
+    )
+    result = CliRunner().invoke(
+        cli.app, ["batch", "--execute", "--max-cost", "0.30", "--input", str(path)]
+    )
+    assert result.exit_code == 1 and "第 2 行" in result.output and "第 4 行" in result.output
+    assert caps == [Decimal(".10"), Decimal(".15"), Decimal(".28")]
+    with (tmp_path / "outputs/latest_scan.csv").open(encoding="utf-8-sig", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert [row["title"] for row in rows] == ["'  +1", "'=1+1"]
+    assert rows[0]["count"] == "-1"
+    lines = (tmp_path / "outputs/latest_scan.jsonl").read_text().splitlines()
+    assert [json.loads(line)["title"] for line in lines] == ["  +1", "=1+1"]
+
+
 def test_three_owned_platforms_can_publish_different_videos():
     posts = [
         post("douyin"),
@@ -183,8 +224,8 @@ def test_three_owned_platforms_can_publish_different_videos():
 
 
 def test_unknown_time_and_historical_seeds_do_not_add_coverage():
-    start = datetime(2026, 5, 26, tzinfo=timezone.utc)
-    finish = datetime(2026, 11, 26, tzinfo=timezone.utc)
+    start = datetime(2026, 5, 26, tzinfo=UTC)
+    finish = datetime(2026, 11, 26, tzinfo=UTC)
     posts = [
         post("douyin", platform_post_id="7624150681927528881", published_at=start.replace(month=4)),
         post("channels"),

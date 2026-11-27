@@ -2,19 +2,22 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import re
+from decimal import Decimal
 from pathlib import Path
+from typing import Annotated
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
 
+import httpx
+import psycopg
 import typer
 from rich import print
 
 from . import tracking
-from .adapters import ADAPTERS, channels_account_ids, is_profile_reference
+from .adapters import ADAPTERS, channels_account_ids, is_profile_reference, verification_text
 from .apify import ApifyClient, safe_error
-from .config import settings
+from .config import actor_build, settings
 from .db import (
     connect,
     db_status,
@@ -23,13 +26,21 @@ from .db import (
     get_posts_by_ids,
     init_db,
     save_candidate_match,
-    save_cover_phash,
+    save_cover_result,
     stored_post,
     upsert_post,
 )
 from .ingest import clean, cover_url, key_for, replay_fields
 from .matching import cover_feature
-from .matrix import CATALOG, REPORT_FIELDS, read_report, search_outcome, search_terms, seed_brand
+from .matrix import (
+    CATALOG,
+    REPORT_FIELDS,
+    matches_search_term,
+    read_report,
+    search_outcome,
+    search_terms,
+    seed_brand,
+)
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -67,13 +78,6 @@ def _persist(item, video_search=False, *, fetch_cover=True):
         metadata["publisher"] = item.author_name
     if media_type != "unknown":
         metadata["media_type"] = media_type
-    verification = (
-        raw.get("verification_text")
-        or raw.get("author_custom_verify")
-        or raw.get("author_enterprise_verify_reason")
-        or raw.get("enterprise_verify_reason")
-    )
-
     image_url = cover_url(item.cover_url)
     post_id = upsert_post(
         {
@@ -91,7 +95,7 @@ def _persist(item, video_search=False, *, fetch_cover=True):
             if item.platform == "channels"
             else None,
             "author_url": clean(item.author_url),
-            "verification": verification if isinstance(verification, str) else None,
+            "verification": verification_text(raw),
             "metadata": metadata,
         }
     )
@@ -102,34 +106,20 @@ def _persist(item, video_search=False, *, fetch_cover=True):
 
 
 def _export(rows):
-    out = Path("outputs")
-    out.mkdir(exist_ok=True)
-    with (out / "latest_scan.jsonl").open("w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
-    keys = list(dict.fromkeys(k for row in rows for k in row.keys()))
-    with (out / "latest_scan.csv").open("w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=keys or ["status"])
-        writer.writeheader()
-        writer.writerows(rows)
+    for fmt in ("jsonl", "csv"):
+        write_report("scan", fmt, Path(f"outputs/latest_scan.{fmt}"), rows)
 
 
 def _ensure_cover(post_id, url, existing, platform):
     if existing:
         return existing
     value, status = cover_feature(url, platform)
-    with connect() as db:
-        db.execute(
-            """UPDATE catering_watch.posts SET metadata=metadata || jsonb_build_object('cover_status',%s::text) WHERE project_key=%s AND id=%s""",
-            (status, settings.project_key, post_id),
-        )
-    save_cover_phash(post_id, value)
+    save_cover_result(post_id, value, status)
     return value
 
 
-def _cross_search(source_platform, query, max_items, max_cost):
-    budget = tracking.Budget(max_cost, execute=True)
-    build = os.getenv("APIFY_BUILD", "latest")
+def _cross_search(source_platform, query, max_items, budget):
+    build = actor_build()
     output = []
     failures = []
     successes = 0
@@ -137,6 +127,9 @@ def _cross_search(source_platform, query, max_items, max_cost):
         try:
             adapter = ADAPTERS[target]()
             payload = adapter.search_payload(query, max_items)
+            if not budget.execute:
+                budget.request(target, payload, max_items)
+                continue
             cached = find_cached_fetch(key_for(adapter.actor, payload, build))
             ids = cached["metadata"]["post_db_ids"] if cached else []
             posts = get_posts_by_ids(ids)
@@ -190,24 +183,21 @@ def _cross_search(source_platform, query, max_items, max_cost):
                     }
                 )
             successes += 1
-        except Exception as exc:
+        except (OSError, RuntimeError, ValueError, httpx.HTTPError, psycopg.Error) as exc:
             failures.append(f"{target} 检索失败 ({safe_error(exc)})")
+    if not budget.execute:
+        print({"source": source_platform, "query": query, "operations": budget.steps})
     if failures:
-        if successes:
-            _export(output)
         for failure in failures:
             typer.echo(failure, err=True)
-        typer.echo(
-            "部分平台完成，已导出可用结果。" if successes else "所有目标平台均未完成。", err=True
-        )
-        raise typer.Exit(1)
-    return output
+        typer.echo("部分平台完成。" if successes else "所有目标平台均未完成。", err=True)
+    return output if successes else None, not failures
 
 
 @app.command()
 def doctor(check_apify: bool = typer.Option(False, "--check-apify")):
     """Check configuration and Neon; no scraping."""
-    database_ready = bool(settings.database_url and "<" not in settings.database_url)
+    database_ready = bool(settings.database_url)
     print(
         {
             "database_configured": database_ready,
@@ -220,7 +210,8 @@ def doctor(check_apify: bool = typer.Option(False, "--check-apify")):
         raise typer.Exit(1)
     print({"neon": dict(db_status())})
     if check_apify:
-        print({"apify": ApifyClient().check_auth()})
+        with ApifyClient() as client:
+            print({"apify": client.check_auth()})
 
 
 @app.command("init-db")
@@ -244,17 +235,16 @@ def scan(
     execute: bool = typer.Option(False, "--execute"),
 ):
     """Search the other two platforms from a platform/business/content clue."""
-    if platform not in ADAPTERS:
-        raise typer.BadParameter("Unsupported platform")
-    if not _budget_check(max_cost, execute):
-        print(
-            {"source": platform, "targets": [p for p in ADAPTERS if p != platform], "query": query}
-        )
-        return
-    db_status()
-    rows = _cross_search(platform, query, max_items or settings.max_items_per_search, max_cost)
-    _export(rows)
-    print(f"Exported {len(rows)} candidate rows.")
+    budget = _budget(platform, max_cost, execute)
+    if execute:
+        db_status()
+    rows, complete = _cross_search(
+        platform, query, max_items or settings.max_items_per_search, budget
+    )
+    if rows is not None:
+        _export(rows)
+    if not complete:
+        raise typer.Exit(1)
 
 
 @app.command("scan-url")
@@ -267,18 +257,24 @@ def scan_url(
     execute: bool = typer.Option(False, "--execute"),
 ):
     """Start from any public post/profile URL and search the other two platforms."""
+    _budget_check(max_cost, execute)
+    if execute:
+        db_status()
+    rows = _scan_url(url, platform, query, max_items, tracking.Budget(max_cost, execute))
+    if rows is not None:
+        _export(rows)
+
+
+def _scan_url(url, platform, query, max_items, budget):
     source = platform or tracking.platform_for(url)
     if source not in ADAPTERS:
         raise typer.BadParameter("Unsupported platform")
-    _budget_check(max_cost, execute)
-    budget = tracking.Budget(max_cost, execute)
-    if execute:
-        db_status()
-        if "://" in url:
-            url = tracking.resolve(url, source)
+    execute = budget.execute
+    if execute and "://" in url:
+        url = tracking.resolve(url, source)
     match = re.search(r"(?:/video/|modal_id=)([0-9]+)", url) if source == "douyin" else None
     existing = None
-    if match and (execute or (settings.database_url and "<" not in settings.database_url)):
+    if match and (execute or settings.database_url):
         existing = stored_post(source, match[1])
     adapter = ADAPTERS[source]()
     profile = is_profile_reference(source, url)
@@ -320,7 +316,7 @@ def scan_url(
     brand = seed_brand(source, first["platform_post_id"])
     if not brand:
         brand = next(
-            (b for b in CATALOG if (query or first["author_name"]) in search_terms(b)), None
+            (b for b in CATALOG if matches_search_term(b, query or first["author_name"])), None
         )
     name = (brand or {}).get("name") or query or first["author_name"]
     if not name:
@@ -348,8 +344,8 @@ def scan_url(
     for target, uid in sorted(targets):
         tracking.sync(name, target, uid, budget, max_items, _persist)
     rows = [r for r in read_report("reposts") if r["competitor"] == name]
-    _export(rows)
     print(budget.steps)
+    return rows
 
 
 def _budget(platform, max_cost, execute):
@@ -452,50 +448,73 @@ def match_local(output: Path = Path("outputs/local-matches.jsonl")):
 
 @app.command()
 def batch(
-    input: Path = typer.Option(..., "--input", exists=True, readable=True),
+    input: Annotated[Path, typer.Option("--input", exists=True, readable=True)],
     execute: bool = typer.Option(False, "--execute"),
     max_cost: float = typer.Option(None, "--max-cost"),
 ):
     """CSV columns: platform,url,query,max_items. Dry-run by default."""
+    _budget_check(max_cost, execute)
+    jobs = []
+    complete = True
     with input.open(encoding="utf-8-sig", newline="") as f:
-        rows = list(csv.DictReader(f))
-    if not _budget_check(max_cost, execute):
-        print(f"DRY RUN: {len(rows)} rows")
-        [print(row) for row in rows]
-        return
-    if not rows:
-        return
-    per_row = max_cost / len(rows)
-    for row in rows:
-        url = (row.get("url") or "").strip()
-        query = (row.get("query") or "").strip()
-        platform = (row.get("platform") or "").strip()
-        if url:
-            scan_url(
-                url=url,
-                platform=platform,
-                query=query,
-                max_items=int(row.get("max_items") or 3),
-                max_cost=per_row,
-                execute=True,
+        for line, row in enumerate(csv.DictReader(f), start=2):
+            url, query, platform = (
+                (row.get(k) or "").strip() for k in ("url", "query", "platform")
             )
-        elif platform in ADAPTERS and query:
-            scan(
-                platform=platform,
-                query=query,
-                max_items=int(row.get("max_items") or settings.max_items_per_search),
-                max_cost=per_row,
-                execute=True,
-            )
-        else:
-            print(f"[yellow]Skip invalid CSV row: {row}[/yellow]")
+            try:
+                if url and (not platform or "://" in url):
+                    detected = tracking.platform_for(url)
+                    if platform and detected != platform:
+                        raise ValueError("平台与链接不符")
+                    platform = detected
+                limit = int(row.get("max_items") or (3 if url else settings.max_items_per_search))
+                if platform not in ADAPTERS or not (url or query) or limit < 1:
+                    raise ValueError("需要有效的平台、入口或检索词及正整数条数")
+            except ValueError:
+                typer.echo(f"第 {line} 行输入无效，已跳过。", err=True)
+                complete = False
+                continue
+            jobs.append((line, url, query, platform, limit))
+    if jobs and execute:
+        db_status()
+    remaining = Decimal(str(max_cost or settings.max_cost_usd))
+    output = None
+    for index, (line, url, query, platform, limit) in enumerate(jobs):
+        cap = remaining / (len(jobs) - index)
+        budget = tracking.Budget(cap, execute)
+        try:
+            if url:
+                result = _scan_url(url, platform, query, limit, budget)
+            else:
+                result, ok = _cross_search(platform, query, limit, budget)
+                complete = complete and ok
+            if result is not None:
+                if output is None:
+                    output = []
+                output.extend(result)
+        except (
+            OSError,
+            RuntimeError,
+            ValueError,
+            httpx.HTTPError,
+            psycopg.Error,
+            typer.BadParameter,
+            typer.Exit,
+        ) as exc:
+            typer.echo(f"第 {line} 行未完成 ({safe_error(exc)})", err=True)
+            complete = False
+        remaining -= cap - budget.remaining
+    if output is not None:
+        _export(output)
+    if not complete:
+        raise typer.Exit(1)
 
 
 @app.command()
 def report(
     format: str = typer.Option("csv", "--format"),
     kind: str = typer.Option("matches", "--kind"),
-    output: Path = typer.Option(Path("outputs/report.csv"), "--output"),
+    output: Path = Path("outputs/report.csv"),
 ):
     """Export persisted accounts, posts or match candidates."""
     queries = {
@@ -536,28 +555,30 @@ def write_report(kind, format, output, rows):
                 else REPORT_FIELDS.get(kind, ["kind"]),
             )
             writer.writeheader()
-            writer.writerows(
-                {
-                    k: json.dumps(v, ensure_ascii=False, default=str)
-                    if isinstance(v, (dict, list))
-                    else v
-                    for k, v in r.items()
-                }
-                for r in rows
-            )
+            writer.writerows({k: _csv_value(v) for k, v in r.items()} for r in rows)
     else:
         raise typer.BadParameter("format must be csv or jsonl")
     print(f"Exported {len(rows)} {kind} rows to {output}")
 
 
+def _csv_value(value):
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    if isinstance(value, str) and (
+        value.startswith(("\t", "\r", "\n")) or value.lstrip().startswith(("=", "+", "-", "@"))
+    ):
+        return "'" + value
+    return value
+
+
 @app.command("research")
 def research_command(
-    query: list[str] = typer.Option(..., "--query", help="微信作品搜索词，可重复"),
+    query: Annotated[list[str], typer.Option("--query", help="微信作品搜索词，可重复")],
     max_items: int = typer.Option(12, min=1),
     peer_items: int = typer.Option(3, min=1),
     max_details: int = typer.Option(2, min=0),
-    review: Path | None = typer.Option(None, exists=True, readable=True),
-    replay: Path | None = typer.Option(None, exists=True, readable=True),
+    review: Annotated[Path | None, typer.Option(exists=True, readable=True)] = None,
+    replay: Annotated[Path | None, typer.Option(exists=True, readable=True)] = None,
     output: Path = Path("outputs/research.xlsx"),
     execute: bool = False,
     max_cost: float | None = None,
@@ -577,8 +598,12 @@ def research_command(
         if replay and not isinstance(archive, list):
             raise ValueError("回放文件必须为 JSON 数组")
         notes = json.loads(review.read_text(encoding="utf-8")) if review else {}
-        validate_review(notes)
-        worker = Research(budget, lambda item: _persist(item, fetch_cover=False), archive)
+        notes = validate_review(notes)
+        worker = Research(
+            budget,
+            lambda item: _persist(item, video_search=item.platform == "douyin", fetch_cover=False),
+            archive,
+        )
     except (ValueError, TypeError) as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -609,9 +634,13 @@ def research_command(
     result = worker.collect(query, max_items, max_details, peer_items, notes)
     rid = save_report(result)
     typer.echo(f"调研 ID {rid}")
-    if not any(
-        c.get("run_id") and (c.get("count") or c["status"] == "已查无结果")
-        for c in result["checks"]
+    if not (
+        result["videos"]
+        or result["peers"]
+        or any(
+            c.get("run_id") and c["operation"] == "videoSearch" and c["status"] == "已查无结果"
+            for c in result["checks"]
+        )
     ):
         typer.echo("所有查询均未取得可用结果，保留已有导出。", err=True)
         raise typer.Exit(1)

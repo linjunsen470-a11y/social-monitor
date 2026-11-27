@@ -1,4 +1,5 @@
-from catering_watch.adapters import DouyinAdapter, ChannelsAdapter, XiaohongshuAdapter
+from catering_watch.adapters import ChannelsAdapter, DouyinAdapter, XiaohongshuAdapter
+
 
 def test_douyin_normalize():
     item = DouyinAdapter().normalize({
@@ -25,6 +26,7 @@ def test_xhs_normalize():
 
 def test_track_profile_uses_account_path_segment(monkeypatch):
     from typer.testing import CliRunner
+
     from catering_watch import cli
 
     seen = []
@@ -49,6 +51,7 @@ def test_track_profile_uses_account_path_segment(monkeypatch):
 def test_track_douyin_mobile_share_redirect(monkeypatch):
     import httpx
     from typer.testing import CliRunner
+
     from catering_watch import cli
 
     short = "https://v.douyin.com/abc/"
@@ -75,6 +78,7 @@ def test_track_douyin_mobile_share_redirect(monkeypatch):
 
 def test_channels_preview_preserves_only_public_locator():
     from urllib.parse import parse_qs, urlsplit
+
     from catering_watch.adapters import is_profile_reference
     from catering_watch.ingest import clean
 
@@ -93,10 +97,11 @@ def test_channels_preview_preserves_only_public_locator():
 
 def test_scan_exits_nonzero_without_overwriting_last_good_export(monkeypatch, tmp_path):
     from typer.testing import CliRunner
+
     from catering_watch import cli
 
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "db_status", lambda: {})
+    monkeypatch.setattr(cli, "db_status", dict)
 
     def unavailable(*args):
         raise RuntimeError("DB offline")
