@@ -1,10 +1,12 @@
 .env
 .venv/
+.venv-*/
 __pycache__/
 .pytest_cache/
 *.py[cod]
 outputs/
 *.zip
+*.whl
 .env.*
 !.env.example
 .ruff_cache/
@@ -27,4 +29,5 @@ dist/
 secrets/
 data/raw/
 data/replays/
-~$*.xlsx
+# Generated research workbooks, including custom output paths
+*.xlsx

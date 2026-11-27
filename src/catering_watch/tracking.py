@@ -1,6 +1,5 @@
 """Account discovery and incremental catalogue sync using bounded Actor operations."""
 
-import os
 from copy import deepcopy
 from decimal import ROUND_CEILING, Decimal
 from urllib.parse import urljoin, urlsplit
@@ -9,7 +8,7 @@ import httpx
 from psycopg.types.json import Jsonb
 
 from .adapters import ADAPTERS, channels_account_ids, verification_text
-from .config import settings
+from .config import actor_build, settings
 from .db import connect, upsert_account
 from .ingest import ACTIVE, DurableClient, InsufficientBudget, clean, key_for
 
@@ -118,7 +117,7 @@ class Budget:
         )
         status = None
         if not self.execute and settings.database_url:
-            fp = key_for(adapter.actor, payload, os.getenv("APIFY_BUILD", "latest"))
+            fp = key_for(adapter.actor, payload, actor_build())
             with connect() as db:
                 row = db.execute(
                     """SELECT status FROM catering_watch.fetch_runs WHERE project_key=%s

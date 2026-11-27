@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import re
 from decimal import Decimal
 from pathlib import Path
@@ -18,7 +17,7 @@ from rich import print
 from . import tracking
 from .adapters import ADAPTERS, channels_account_ids, is_profile_reference, verification_text
 from .apify import ApifyClient, safe_error
-from .config import settings
+from .config import actor_build, settings
 from .db import (
     connect,
     db_status,
@@ -120,7 +119,7 @@ def _ensure_cover(post_id, url, existing, platform):
 
 
 def _cross_search(source_platform, query, max_items, budget):
-    build = os.getenv("APIFY_BUILD", "latest")
+    build = actor_build()
     output = []
     failures = []
     successes = 0

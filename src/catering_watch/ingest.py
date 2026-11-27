@@ -2,7 +2,6 @@
 
 import hashlib
 import json
-import os
 import time
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -13,7 +12,7 @@ from zoneinfo import ZoneInfo
 from psycopg.types.json import Jsonb
 
 from .apify import ApifyClient, ApifyError, StartRejected
-from .config import env_value, settings
+from .config import actor_build, env_value, settings
 from .db import connect
 
 ACTIVE = ("STARTING", "RUNNING", "RECONCILE")
@@ -217,7 +216,7 @@ class DurableClient:
         self.transport = transport
 
     def run(self, actor, payload, max_cost_usd, *, on_cost=None):
-        build = os.getenv("APIFY_BUILD", "latest")
+        build = actor_build()
         cap = Decimal(str(max_cost_usd)).quantize(Decimal(".0001"), rounding=ROUND_DOWN)
         price = self.adapter.item_price(payload["operation"])
         start = Decimal(str(self.adapter.start_fee))

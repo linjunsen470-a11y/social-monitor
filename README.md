@@ -7,7 +7,6 @@ Agent-first Python CLI for public competitor research across Douyin, WeChat Chan
 - Database：`catering_monitor`
 - Schema：`catering_watch`
 - Runtime role：`catering_watch_app`（仅限 schema 读写）
-- 首轮试采结果收录在 `FIRST_RUN_RESULTS.md`。
 - Apify REST 鉴权及三平台采集已有实测记录。本次开发验收使用历史响应回放。
 - 没有创建定时任务或部署服务。
 
@@ -125,7 +124,7 @@ competitor-watch report --kind reposts --format jsonl --output outputs/reposts.j
 
 ## 版本库约定
 
-提交源码、测试、种子样例和开发说明。实际连接信息放在本地 `.env` 或运行环境的 Secrets 中。报告写到 `outputs/`，构建产物、缓存、压缩包和本地配置由 Git 忽略。
+提交源码、测试、种子样例和开发说明。实际连接信息放在本地 `.env` 或运行环境的 Secrets 中。默认报告写到 `outputs/`。本地回放放在 `data/replays/`，原始数据放在 `data/raw/`。Git 会忽略这些目录、Excel 工作簿和 Python 构建产物。PR 检查使用临时 PostgreSQL 和模拟 Apify 响应。
 
 ## 账号级追踪与恢复
 
